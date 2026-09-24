@@ -366,6 +366,24 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 	return actor, nil
 }
 
+// GetActor fetches an actor. A missing actor is reported as a nil actor rather
+// than an error, so callers can treat absence as one more state.
+func (c *Client) GetActor(ctx context.Context, atespace, actorName string) (*ateapipb.Actor, error) {
+	actor, err := c.control.GetActor(ctx, &ateapipb.GetActorRequest{
+		Actor: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     actorName,
+		},
+	})
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("getting actor %s/%s: %w", atespace, actorName, err)
+	}
+	return actor, nil
+}
+
 // ResumeActor resumes the specified actor onto a worker and returns the worker details.
 func (c *Client) ResumeActor(ctx context.Context, atespace, actorName string) (*ateapipb.Actor, string, error) {
 	req := &ateapipb.ResumeActorRequest{
@@ -415,6 +433,22 @@ func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string) er
 	_, err := c.control.DeleteActor(ctx, req)
 	if err != nil && status.Code(err) != codes.NotFound {
 		return fmt.Errorf("deleting actor %s/%s: %w", atespace, actorName, err)
+	}
+	return nil
+}
+
+// DeleteEgressPolicy removes the actor's egress policy. A missing policy or a
+// missing actor is not an error, so the call can be repeated safely.
+func (c *Client) DeleteEgressPolicy(ctx context.Context, atespace, actorName string) error {
+	req := &ateapipb.DeleteActorEgressPolicyRequest{
+		Actor: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     actorName,
+		},
+	}
+	_, err := c.control.DeleteActorEgressPolicy(ctx, req)
+	if err != nil && status.Code(err) != codes.NotFound {
+		return fmt.Errorf("deleting egress policy on %s/%s: %w", atespace, actorName, err)
 	}
 	return nil
 }
