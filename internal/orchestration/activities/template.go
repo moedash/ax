@@ -32,15 +32,6 @@ import (
 // ActorTemplate name.
 const templateDigestBytes = 4
 
-// Environment variables the runner reads inside the sandbox.
-const (
-	EnvTaskYAML          = "AX_TASK_YAML"
-	EnvWorkspacesYAML    = "AX_WORKSPACES_YAML"
-	EnvWorkflowID        = "AX_WORKFLOW_ID"
-	EnvTemporalAddress   = "AX_TEMPORAL_ADDRESS"
-	EnvTemporalNamespace = "AX_TEMPORAL_NAMESPACE"
-)
-
 // TaskTemplateName derives a task's ActorTemplate name from a digest of the
 // specs that end up inside the container: the task itself and every workspace
 // it binds. A spec change yields a new template, and an unchanged spec always
@@ -118,24 +109,24 @@ func (a *Activities) containerEnv(ctx context.Context, in TemplateInput) (map[st
 	if err != nil {
 		return nil, invalidSpec("rendering task yaml: %v", err)
 	}
-	env[EnvTaskYAML] = string(taskYAML)
+	env[v1alpha1.EnvTaskYAML] = string(taskYAML)
 
 	wsYAML, err := marshalWorkspaces(in.Workspaces)
 	if err != nil {
 		return nil, invalidSpec("rendering workspace yaml: %v", err)
 	}
 	if wsYAML != "" {
-		env[EnvWorkspacesYAML] = wsYAML
+		env[v1alpha1.EnvWorkspacesYAML] = wsYAML
 	}
 
 	if in.WorkflowID != "" {
-		env[EnvWorkflowID] = in.WorkflowID
+		env[v1alpha1.EnvWorkflowID] = in.WorkflowID
 	}
 	if a.TemporalAddress != "" {
-		env[EnvTemporalAddress] = a.TemporalAddress
+		env[v1alpha1.EnvTemporalAddress] = a.TemporalAddress
 	}
 	if a.TemporalNamespace != "" {
-		env[EnvTemporalNamespace] = a.TemporalNamespace
+		env[v1alpha1.EnvTemporalNamespace] = a.TemporalNamespace
 	}
 	return env, nil
 }

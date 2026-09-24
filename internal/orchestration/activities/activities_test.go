@@ -15,6 +15,7 @@
 package activities_test
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -33,7 +34,7 @@ import (
 )
 
 // noSecrets never finds a key and never touches a cluster.
-func noSecrets(_ any, _, _, _ string) (string, error) { return "", nil }
+func noSecrets(context.Context, string, string, string) (string, error) { return "", nil }
 
 // newEnv wires the activities against a fake Control API.
 func newEnv(t *testing.T, control *substratetest.ControlServer) (*testsuite.TestActivityEnvironment, *activities.Activities) {
@@ -46,6 +47,7 @@ func newEnv(t *testing.T, control *substratetest.ControlServer) (*testsuite.Test
 
 	acts := &activities.Activities{
 		Substrate:         client,
+		SecretResolver:    noSecrets,
 		TemporalAddress:   "temporal-frontend.temporal.svc.cluster.local:7233",
 		TemporalNamespace: "default",
 	}
@@ -140,7 +142,6 @@ func TestProvisioningSequence(t *testing.T) {
 func TestActorTemplateCarriesTheRunnerEnvironment(t *testing.T) {
 	control := substratetest.NewControlServer()
 	env, acts := newEnv(t, control)
-	acts.SecretResolver = nil
 
 	task := testTask()
 	task.Status = &v1alpha1.TaskStatus{Phase: v1alpha1.PhaseRunning, WorkerIp: "10.0.0.1"}
@@ -171,23 +172,23 @@ func TestActorTemplateCarriesTheRunnerEnvironment(t *testing.T) {
 	if got := templateEnv["GOAL"]; got != "fix the bug" {
 		t.Errorf("expected the task env to be passed through, got %q", got)
 	}
-	if got := templateEnv[activities.EnvWorkflowID]; got != "default/job" {
+	if got := templateEnv[v1alpha1.EnvWorkflowID]; got != "default/job" {
 		t.Errorf("expected the workflow ID in the container env, got %q", got)
 	}
-	if got := templateEnv[activities.EnvTemporalAddress]; got == "" {
+	if got := templateEnv[v1alpha1.EnvTemporalAddress]; got == "" {
 		t.Error("expected the Temporal address in the container env")
 	}
-	taskYAML := templateEnv[activities.EnvTaskYAML]
+	taskYAML := templateEnv[v1alpha1.EnvTaskYAML]
 	if !strings.Contains(taskYAML, "name: job") {
-		t.Errorf("expected the task spec in %s, got %q", activities.EnvTaskYAML, taskYAML)
+		t.Errorf("expected the task spec in %s, got %q", v1alpha1.EnvTaskYAML, taskYAML)
 	}
 	// The status is the workflow's own view of the task and changes constantly;
 	// shipping it would make every status update a new template.
 	if strings.Contains(taskYAML, "workerIP") {
-		t.Errorf("expected no status in %s, got %q", activities.EnvTaskYAML, taskYAML)
+		t.Errorf("expected no status in %s, got %q", v1alpha1.EnvTaskYAML, taskYAML)
 	}
-	if got := templateEnv[activities.EnvWorkspacesYAML]; !strings.Contains(got, "name: repo") {
-		t.Errorf("expected the workspace spec in %s, got %q", activities.EnvWorkspacesYAML, got)
+	if got := templateEnv[v1alpha1.EnvWorkspacesYAML]; !strings.Contains(got, "name: repo") {
+		t.Errorf("expected the workspace spec in %s, got %q", v1alpha1.EnvWorkspacesYAML, got)
 	}
 }
 

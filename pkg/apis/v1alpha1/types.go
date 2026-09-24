@@ -40,6 +40,22 @@ const (
 	DefaultAtespace = "default"
 )
 
+// Environment variables AX sets in every task container. They are the contract
+// between the control plane and whatever runs as PID 1 inside the sandbox.
+const (
+	// EnvTaskYAML carries the Task resource, without its status.
+	EnvTaskYAML = "AX_TASK_YAML"
+	// EnvWorkspacesYAML carries every bound Workspace as a multi-document YAML
+	// stream, in binding order.
+	EnvWorkspacesYAML = "AX_WORKSPACES_YAML"
+	// EnvWorkflowID names the task's workflow, which is where the runner reports
+	// how the task command finished.
+	EnvWorkflowID = "AX_WORKFLOW_ID"
+	// EnvTemporalAddress and EnvTemporalNamespace are where that report goes.
+	EnvTemporalAddress   = "AX_TEMPORAL_ADDRESS"
+	EnvTemporalNamespace = "AX_TEMPORAL_NAMESPACE"
+)
+
 // Task phases reported on status.phase. A task's phase is derived from the state
 // of its sandbox, so the same task can move back and forth between them.
 const (
