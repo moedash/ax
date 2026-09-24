@@ -16,8 +16,8 @@ AX does not run `spec.command` as the container entrypoint. It always starts the
 | Container command | `/usr/local/bin/ax-task-runner`, always |
 | `AX_TASK_YAML` | The `Task` resource as YAML, without its status |
 | `AX_WORKSPACES_YAML` | Every bound `Workspace` resource as a multi-document YAML stream, in the task's binding order |
-| `AX_WORKFLOW_ID` | The task's workflow, which is where the runner reports how the task command finished |
-| `AX_TEMPORAL_ADDRESS`, `AX_TEMPORAL_NAMESPACE` | Where that report goes |
+| `AX_WORKFLOW_ID` | The task's workflow, which is where the runner reports how the task command finished. Only set when the controller runs with `--sandbox-report-completion` |
+| `AX_TEMPORAL_ADDRESS`, `AX_TEMPORAL_NAMESPACE` | Where that report goes, under the same flag |
 | `spec.env` entries | Each one set directly in the container environment |
 | `GEMINI_API_KEY` | Set when the atespace has a Gemini credential configured |
 | Volume | A durable directory mounted at `/workspace` |
@@ -44,7 +44,7 @@ The `/workspace` volume is what survives suspend and resume. Agent Substrate sna
 
 **Stay up after the command exits.** The runner is PID 1, and the container lives as long as it does. If the runner exits when the command does, the metadata server goes with it and `ax ssh` stops working. Keep serving until you are told to stop.
 
-**Report the exit status.** When the command finishes, send the `complete` update to the workflow named by `AX_WORKFLOW_ID` at `AX_TEMPORAL_ADDRESS`, carrying the exit code. That is what moves the task to `Completed` and fills in `status.exitCode`. Keep it best effort: the sandbox has to stay up and inspectable whether or not the control plane can be reached. The default runner tries the update, falls back to a signal of the same name, and gives up after ten seconds.
+**Report the exit status, if you were told where.** When the command finishes and `AX_WORKFLOW_ID` is set, send the `complete` update to that workflow at `AX_TEMPORAL_ADDRESS`, carrying the exit code. Those variables are absent unless the controller was started with `--sandbox-report-completion`, and then there is nothing to report to: log the exit code and carry on. That is what moves the task to `Completed` and fills in `status.exitCode`. Keep it best effort: the sandbox has to stay up and inspectable whether or not the control plane can be reached. The default runner tries the update, falls back to a signal of the same name, and gives up after ten seconds.
 
 **Shut down cleanly on `SIGTERM`.** Stop and suspend both deliver `SIGTERM` to PID 1. Forward it to the command's process group, wait a bounded grace period, then `SIGKILL` whatever is left. Flush anything the agent needs to survive a resume before you exit.
 

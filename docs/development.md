@@ -30,9 +30,15 @@ Determinism is checked separately, and is worth running after any change to
 `internal/orchestration/workflows`:
 
 ```bash
-go install go.temporal.io/sdk/contrib/tools/workflowcheck@latest
-workflowcheck ./internal/orchestration/...
+workflowcheck-go1.27 -test=false ./internal/orchestration/...
 ```
+
+`go install` does not give you a usable binary: the tool's module carries a
+`go 1.24` directive, so it type-checks Go 1.27 packages with a 1.24
+`go/types`, reports `package requires newer Go version` for much of the
+standard library, and then exits 0 behind those errors. Build it against a
+newer `x/tools` once, as described in
+[Temporal orchestration](temporal.md#versioning).
 
 To run the control plane on your machine, see
 [Temporal orchestration](temporal.md#running-it-locally).

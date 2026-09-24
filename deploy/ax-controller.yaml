@@ -74,6 +74,9 @@ spec:
             - "--temporal-address=temporal-frontend.temporal.svc.cluster.local:7233"
             - "--temporal-namespace=default"
             - "--task-queue=ax-tasks"
+            # Off by default: it gives anything in a sandbox a route to the
+            # Temporal frontend. See docs/temporal.md, "Trust boundary".
+            - "--sandbox-report-completion=false"
             - "--substrate-endpoint=api.ate-system.svc.cluster.local:443"
             - "--substrate-authority=api.ate-system.svc"
             - "--substrate-token-file=/var/run/secrets/ateapi/token"

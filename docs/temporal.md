@@ -56,11 +56,16 @@ state, so it resumes where it stopped.
 
 1. **Apply.** `ax apply` reaches `UpdateTask`. The API server validates the spec,
    resolves the gateway and workspaces the task binds, and sends the `apply`
-   update together with a workflow start. A task that already exists takes the
-   update; a task whose workflow has ended is started again under the same name.
+   update together with a workflow start. Two policies on that start decide what
+   happens next: `WorkflowIDConflictPolicy: USE_EXISTING` makes a task that is
+   already running take the update rather than fail or fork, and
+   `WorkflowIDReusePolicy: ALLOW_DUPLICATE` lets a task be created again under
+   the same name once its workflow has ended, which is the normal case after a
+   delete.
 2. **Provision.** The workflow runs, in order: `EnsureAtespace`,
    `EnsureActorTemplate`, `EnsureActor`, `ApplyEgressPolicy`. Each compensation
-   is registered before the step it undoes.
+   is registered before the step it undoes, and only undoes what the pass
+   itself created.
 3. **Activate.** `SuspendActor` or `ResumeActor`, depending on `spec.suspend`.
    The resume answers with the worker's address, which becomes
    `status.workerIP`.
@@ -75,6 +80,20 @@ state, so it resumes where it stopped.
 `status.phase` is derived from that state in one place, so a task cannot report
 `Running` after its command has exited or `Completed` while its sandbox is
 suspended.
+
+### Applying a changed spec replaces the sandbox
+
+Substrate binds an actor to the ActorTemplate it was created from. Nothing
+rebinds a running actor, so a task whose image, command, environment, or bound
+workspaces change can only adopt that change through a new sandbox. Applying a
+changed spec therefore deletes the actor and creates it again on the new
+template, and the workflow confirms which template the actor ended up on before
+recording the spec as provisioned.
+
+**Whatever the old sandbox had in its workspace is discarded with it.** A task
+that has been working in `/workspace` loses that work, and its `WorkspaceReady`
+condition goes back to False while the replacement sets itself up. Suspending
+and resuming are not spec changes and leave the sandbox alone.
 
 ## Updates, queries, and signals
 
@@ -116,7 +135,7 @@ All of them live in `internal/orchestration/activities/options.go`.
 | `ScheduleToCloseTimeout` on teardown | 10 minutes | Template deletion is rejected while the actor still exists, so teardown has to outlast an actor that is slow to disappear. |
 | `HeartbeatTimeout` | 1 minute | Well above the 10 second heartbeat interval, so a busy worker is not killed for being late. |
 | Retry policy | 1 second initial, coefficient 2, 30 second maximum | Transient Substrate failures clear in seconds. |
-| Resync interval | 5 minutes | A sandbox can crash or be rescheduled without anyone telling AX. |
+| Resync interval | 5 minutes, `--resync-interval` | A sandbox can crash or be rescheduled without anyone telling AX. |
 
 Activities that block in a single control-plane call report liveness from a
 side goroutine, so they can be detected as stuck and can learn that they were
@@ -172,8 +191,10 @@ resources:
   so including them stranded a new template on every status update and every
   suspend.
 - Resolved credentials are excluded as well. The model API key is looked up
-  inside the activity that builds the template, so a rotated key does not fork
-  the template, and no secret is written to workflow history.
+  inside the activity that builds the template, so no secret is written to
+  workflow history. The consequence is worth knowing: rotating the key does not
+  by itself produce a new template, so a sandbox keeps the key it was built with
+  until some other spec change replaces the template.
 
 ## Compensations
 
@@ -199,6 +220,37 @@ applied: it must not run without the allowlist it was given. A task with no
 gateway keeps unrestricted egress either way, so there a failure is reported on
 the `GatewayReady` condition and the task runs.
 
+## Trust boundary
+
+A task runs untrusted code. The control plane treats the sandbox accordingly,
+and the one place that judgement is visible is completion reporting.
+
+With `--sandbox-report-completion` off, which is the default, a task container
+is given its own spec, its workspaces, and the model credential it needs, and
+nothing else. It has no address for Temporal and no workflow ID, so the runner
+logs how the command finished and the task stays `Running` until something else
+moves it.
+
+With the flag on, three variables are injected: `AX_WORKFLOW_ID`,
+`AX_TEMPORAL_ADDRESS`, and `AX_TEMPORAL_NAMESPACE`. What that buys is the
+`Completed` phase and `status.exitCode`. What it costs is a route out of the
+sandbox:
+
+- Anything in the container can reach the Temporal frontend at that address.
+- It can send updates and signals to **any workflow it can name**, not only its
+  own. Workflow IDs are `<atespace>/<name>`, which are easy to guess.
+- **No credential is injected.** On a frontend that requires mTLS or an API key
+  the report simply fails and is logged, so the flag is only useful where the
+  frontend accepts unauthenticated callers from the sandbox network.
+- It is therefore only as safe as that frontend's authentication and network
+  reachability. Leave it off when task code is not trusted, or keep the
+  frontend unreachable from sandbox networks.
+
+The follow-up that removes the tradeoff is to have the controller pull the exit
+status through the guest service the sandbox already exposes on port 80, the
+same channel `ax ssh` uses. The sandbox then needs no Temporal reachability at
+all, and the flag can go.
+
 ## Versioning
 
 `TaskWorkflow` records a `provisioning` version marker on every run through
@@ -212,6 +264,22 @@ Two tests guard determinism:
 
 - `workflowcheck` over `./internal/orchestration/...`. The one annotated
   exception is documented where it sits.
+
+  The released tool cannot be used as it ships. Its module carries a `go 1.24`
+  directive, so the binary `go install` produces type-checks Go 1.27 packages
+  with a 1.24 `go/types` and reports `package requires newer Go version` for
+  much of the standard library. It then exits 0 behind those errors, so it looks
+  clean while having checked nothing. Build it against a newer `x/tools`:
+
+  ```bash
+  git clone https://github.com/temporalio/sdk-go
+  cd sdk-go/contrib/tools/workflowcheck
+  go mod edit -go=1.27.0
+  go get golang.org/x/tools@latest
+  go mod tidy
+  go build -o "$(go env GOPATH)/bin/workflowcheck-go1.27" .
+  workflowcheck-go1.27 -test=false ./internal/orchestration/...
+  ```
 - A replay test over a recorded history of a task's whole life, in
   `internal/orchestration/workflows/testdata`. Re-record it with a dev server:
 
@@ -220,6 +288,14 @@ Two tests guard determinism:
   AX_RECORD_HISTORY_ADDRESS=localhost:7466 \
     go test ./internal/orchestration/workflows/ -run TestRecordHistory
   ```
+
+### The resync costs one read per task
+
+Every interval, every settled task reads its actor. At ten thousand tasks and
+the default five minutes that is about thirty reads a second against the
+Control API, and it grows with the fleet. `--resync-interval` on the controller
+is the knob; a Substrate watch, so that AX is told about a crashed or moved
+actor instead of asking, is the follow-up that removes the tradeoff.
 
 ## Long-lived tasks
 
@@ -278,9 +354,13 @@ whole history, and its pending updates.
   or torn down.
 - **The `AxAtespace` search attribute must exist** in the namespace before a
   worker starts, or starting a task fails.
-- **`--sandbox-temporal-address`** is the address task containers dial to report
-  their command's exit. It defaults to `--temporal-address`, which is right when
-  the workers and the sandboxes share a network and wrong when they do not.
+- **Completion reporting is off by default.** `--sandbox-report-completion`
+  turns it on, and `--sandbox-temporal-address` is the address task containers
+  dial. The address defaults to `--temporal-address`, which is right when the
+  workers and the sandboxes share a network and wrong when they do not. See
+  [Trust boundary](#trust-boundary) before turning it on.
+- **`--resync-interval`** is how often a settled task checks its sandbox, five
+  minutes by default. Each interval costs one read per task.
 - **A task is now a workflow.** `temporal workflow list --query "WorkflowType =
   'TaskWorkflow'"` lists them, `temporal workflow show -w <atespace>/<name>`
   shows everything that has happened to one, and a task stuck in `Pending` shows
