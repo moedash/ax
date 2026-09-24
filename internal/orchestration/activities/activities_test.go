@@ -46,10 +46,8 @@ func newEnv(t *testing.T, control *substratetest.ControlServer) (*testsuite.Test
 	t.Cleanup(stop)
 
 	acts := &activities.Activities{
-		Substrate:         client,
-		SecretResolver:    noSecrets,
-		TemporalAddress:   "temporal-frontend.temporal.svc.cluster.local:7233",
-		TemporalNamespace: "default",
+		Substrate:      client,
+		SecretResolver: noSecrets,
 	}
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestActivityEnvironment()
@@ -92,17 +90,49 @@ func TestProvisioningSequence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureActorTemplate failed: %v", err)
 	}
-	var resolved activities.TemplateRef
-	if err := value.Get(&resolved); err != nil {
-		t.Fatalf("decoding the template ref: %v", err)
+	var provisionedTemplate activities.TemplateProvision
+	if err := value.Get(&provisionedTemplate); err != nil {
+		t.Fatalf("decoding the template result: %v", err)
 	}
-	if resolved != template {
-		t.Errorf("expected template %v, got %v", template, resolved)
+	if !provisionedTemplate.Created {
+		t.Error("expected the first call to create the template")
+	}
+	if provisionedTemplate.Template != template {
+		t.Errorf("expected template %v, got %v", template, provisionedTemplate.Template)
+	}
+
+	// A second call finds the template rather than making it, so a rollback
+	// knows it is not its to delete.
+	value, err = env.ExecuteActivity(acts.EnsureActorTemplate, activities.TemplateInput{
+		Template:   template,
+		Image:      task.Spec.Image,
+		Task:       task,
+		WorkflowID: "default/job",
+	})
+	if err != nil {
+		t.Fatalf("EnsureActorTemplate failed: %v", err)
+	}
+	if err := value.Get(&provisionedTemplate); err != nil {
+		t.Fatalf("decoding the template result: %v", err)
+	}
+	if provisionedTemplate.Created {
+		t.Error("expected the second call to find the template")
 	}
 
 	actor := activities.ActorRef{Atespace: "default", Name: "job"}
-	if _, err := env.ExecuteActivity(acts.EnsureActor, activities.ActorInput{Actor: actor, Template: resolved}); err != nil {
+	value, err = env.ExecuteActivity(acts.EnsureActor, activities.ActorInput{Actor: actor, Template: template})
+	if err != nil {
 		t.Fatalf("EnsureActor failed: %v", err)
+	}
+	var placed activities.ActorProvision
+	if err := value.Get(&placed); err != nil {
+		t.Fatalf("decoding the actor result: %v", err)
+	}
+	if !placed.Created {
+		t.Error("expected the first call to create the actor")
+	}
+	if placed.Template != template {
+		t.Errorf("expected the actor on template %v, got %v", template, placed.Template)
 	}
 	if _, err := env.ExecuteActivity(acts.ApplyEgressPolicy, activities.EgressInput{
 		Actor:     actor,
@@ -137,11 +167,14 @@ func TestProvisioningSequence(t *testing.T) {
 	}
 }
 
-// The runner inside the sandbox is handed the specs and the address of the
-// workflow that owns the task.
+// The runner inside the sandbox is handed the specs, and the coordinates of
+// the workflow that owns the task when the worker offers them.
 func TestActorTemplateCarriesTheRunnerEnvironment(t *testing.T) {
 	control := substratetest.NewControlServer()
 	env, acts := newEnv(t, control)
+	acts.ReportCompletion = true
+	acts.TemporalAddress = "temporal-frontend.temporal.svc.cluster.local:7233"
+	acts.TemporalNamespace = "default"
 
 	task := testTask()
 	task.Status = &v1alpha1.TaskStatus{Phase: v1alpha1.PhaseRunning, WorkerIp: "10.0.0.1"}
@@ -416,5 +449,60 @@ func TestInvalidInputIsNonRetryable(t *testing.T) {
 	}
 	if len(control.Atespaces()) != 0 {
 		t.Errorf("expected no call to Substrate, got %v", control.Atespaces())
+	}
+}
+
+// Reporting is off unless a worker turns it on, so nothing in the sandbox is
+// handed a route to the control plane by default.
+func TestActorTemplateWithholdsTheControlPlaneByDefault(t *testing.T) {
+	control := substratetest.NewControlServer()
+	env, acts := newEnv(t, control)
+	acts.TemporalAddress = "temporal-frontend.temporal.svc.cluster.local:7233"
+	acts.TemporalNamespace = "default"
+
+	task := testTask()
+	name := activities.TaskTemplateName(task, nil)
+	if _, err := env.ExecuteActivity(acts.EnsureActorTemplate, activities.TemplateInput{
+		Template:   activities.TemplateRef{Atespace: "default", Name: name},
+		Image:      task.Spec.Image,
+		Task:       task,
+		WorkflowID: "default/job",
+	}); err != nil {
+		t.Fatalf("EnsureActorTemplate failed: %v", err)
+	}
+
+	templateEnv, err := control.TemplateEnv(name)
+	if err != nil {
+		t.Fatalf("reading the created template: %v", err)
+	}
+	for _, key := range []string{v1alpha1.EnvWorkflowID, v1alpha1.EnvTemporalAddress, v1alpha1.EnvTemporalNamespace} {
+		if got, ok := templateEnv[key]; ok {
+			t.Errorf("expected no %s in the container env, got %q", key, got)
+		}
+	}
+	// The task's own environment and specs are still handed over.
+	if templateEnv["GOAL"] == "" || templateEnv[v1alpha1.EnvTaskYAML] == "" {
+		t.Error("expected the task env and spec to be passed through")
+	}
+}
+
+// A template rollback names the one template the pass created.
+func TestDeleteActorTemplateIfExists(t *testing.T) {
+	control := substratetest.NewControlServer("job-tmpl-0a1b2c3d", "job-tmpl-deadbeef")
+	env, acts := newEnv(t, control)
+
+	if _, err := env.ExecuteActivity(acts.DeleteActorTemplateIfExists,
+		activities.TemplateRef{Atespace: "default", Name: "job-tmpl-0a1b2c3d"}); err != nil {
+		t.Fatalf("DeleteActorTemplateIfExists failed: %v", err)
+	}
+	if got := control.DeletedTemplates(); len(got) != 1 || got[0] != "job-tmpl-0a1b2c3d" {
+		t.Errorf("expected only the named template to be deleted, got %v", got)
+	}
+
+	// A template that is already gone is not an error, so a rollback can be
+	// retried.
+	if _, err := env.ExecuteActivity(acts.DeleteActorTemplateIfExists,
+		activities.TemplateRef{Atespace: "default", Name: "job-tmpl-0a1b2c3d"}); err != nil {
+		t.Fatalf("DeleteActorTemplateIfExists on a missing template failed: %v", err)
 	}
 }

@@ -58,8 +58,14 @@ type Activities struct {
 	// RouterAddr is the atenet router used to reach a sandbox by actor name when
 	// its worker IP is not routable from the worker.
 	RouterAddr string
-	// TemporalAddress and TemporalNamespace are handed to the task container so
-	// its runner can report the command's exit status back to the task workflow.
+	// ReportCompletion hands task containers the coordinates of their own
+	// workflow so the runner can report the command's exit status. It is off by
+	// default: anything running in a sandbox could then reach the frontend and
+	// address other workflows, which is only as safe as the frontend's own
+	// authentication.
+	ReportCompletion bool
+	// TemporalAddress and TemporalNamespace are the coordinates handed over when
+	// ReportCompletion is set.
 	TemporalAddress   string
 	TemporalNamespace string
 	// HTTPClient probes sandbox readiness. Nil uses a client with probeTimeout.
@@ -122,6 +128,28 @@ const (
 	ActorStateCrashed   = "ACTOR_STATE_CRASHED"
 )
 
+// TemplateProvision reports what EnsureActorTemplate did.
+type TemplateProvision struct {
+	// Created is true when this call made the template. Only what a pass created
+	// may be rolled back by it.
+	Created bool
+	// Template is where the actor template now lives.
+	Template TemplateRef
+}
+
+// ActorProvision reports what EnsureActor did.
+type ActorProvision struct {
+	// Created is true when this call made the actor, rather than finding one
+	// that was already there. Only what a pass created may be rolled back by it.
+	Created bool
+	// Template is the ActorTemplate the actor derives from. Substrate binds this
+	// when the actor is created, so it is how the workflow sees whether a new
+	// spec has been adopted.
+	Template TemplateRef
+	State    string
+	WorkerIP string
+}
+
 // ActorObservation is what the workflow needs to know about a sandbox that
 // already exists.
 type ActorObservation struct {
@@ -158,24 +186,22 @@ func (a *Activities) EnsureAtespace(ctx context.Context, in AtespaceInput) error
 // The template carries the container image and the environment the runner needs:
 // the task and workspace specs, the model credentials, and the address of the
 // task workflow.
-func (a *Activities) EnsureActorTemplate(ctx context.Context, in TemplateInput) (TemplateRef, error) {
+func (a *Activities) EnsureActorTemplate(ctx context.Context, in TemplateInput) (TemplateProvision, error) {
 	if in.Template.Atespace == "" || in.Template.Name == "" {
-		return TemplateRef{}, invalidSpec("template atespace and name are required")
+		return TemplateProvision{}, invalidSpec("template atespace and name are required")
 	}
 	logger := activity.GetLogger(ctx)
 	logger.Info("ensuring actor template", "template", in.Template.Name, "image", in.Image)
 
 	env, err := a.containerEnv(ctx, in)
 	if err != nil {
-		return TemplateRef{}, err
+		return TemplateProvision{}, err
 	}
 
-	tmpl, err := a.Substrate.EnsureActorTemplateWithImage(ctx,
-		in.Template.Atespace, in.Template.Name,
-		in.Template.Atespace, in.Template.Name,
-		in.Image, env)
+	tmpl, created, err := a.Substrate.EnsureActorTemplateWithImage(ctx,
+		in.Template.Atespace, in.Template.Name, in.Image, env)
 	if err != nil {
-		return TemplateRef{}, classify(err)
+		return TemplateProvision{}, classify(err)
 	}
 	ref := in.Template
 	if tmpl.GetMetadata().GetName() != "" {
@@ -184,22 +210,51 @@ func (a *Activities) EnsureActorTemplate(ctx context.Context, in TemplateInput) 
 	if ref.Atespace == "" {
 		ref.Atespace = in.Template.Atespace
 	}
-	return ref, nil
+	return TemplateProvision{Created: created, Template: ref}, nil
+}
+
+// DeleteActorTemplateIfExists removes one ActorTemplate. It compensates
+// EnsureActorTemplate, so it names the single template that pass created rather
+// than everything belonging to the task.
+func (a *Activities) DeleteActorTemplateIfExists(ctx context.Context, in TemplateRef) error {
+	if in.Name == "" {
+		return invalidSpec("template name is required")
+	}
+	activity.GetLogger(ctx).Info("deleting actor template", "template", in.Name)
+
+	stop := heartbeatUntilDone(ctx)
+	defer stop()
+
+	return classify(a.Substrate.DeleteActorTemplate(ctx, in.Atespace, in.Name))
 }
 
 // EnsureActor creates the task's actor from its template. A crashed actor is
 // replaced, which is how a task recovers from a sandbox that died.
-func (a *Activities) EnsureActor(ctx context.Context, in ActorInput) error {
+//
+// An actor that already exists is returned as it is, on whatever template it
+// was created from. The caller compares that against the template it asked for.
+func (a *Activities) EnsureActor(ctx context.Context, in ActorInput) (ActorProvision, error) {
 	if in.Actor.Name == "" || in.Template.Name == "" {
-		return invalidSpec("actor name and template name are required")
+		return ActorProvision{}, invalidSpec("actor name and template name are required")
 	}
 	activity.GetLogger(ctx).Info("ensuring actor", "actor", in.Actor.Name, "template", in.Template.Name)
 
 	stop := heartbeatUntilDone(ctx)
 	defer stop()
 
-	_, err := a.Substrate.EnsureActor(ctx, in.Actor.Atespace, in.Actor.Name, in.Template.Atespace, in.Template.Name)
-	return classify(err)
+	actor, created, err := a.Substrate.EnsureActor(ctx, in.Actor.Atespace, in.Actor.Name, in.Template.Atespace, in.Template.Name)
+	if err != nil {
+		return ActorProvision{}, classify(err)
+	}
+	return ActorProvision{
+		Created: created,
+		Template: TemplateRef{
+			Atespace: actor.GetActorTemplate().GetAtespace(),
+			Name:     actor.GetActorTemplate().GetName(),
+		},
+		State:    actor.GetStatus().GetState().String(),
+		WorkerIP: actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp(),
+	}, nil
 }
 
 // ApplyEgressPolicy installs the gateway's allowlist as the actor's egress

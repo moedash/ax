@@ -119,14 +119,18 @@ func (a *Activities) containerEnv(ctx context.Context, in TemplateInput) (map[st
 		env[v1alpha1.EnvWorkspacesYAML] = wsYAML
 	}
 
-	if in.WorkflowID != "" {
-		env[v1alpha1.EnvWorkflowID] = in.WorkflowID
-	}
-	if a.TemporalAddress != "" {
-		env[v1alpha1.EnvTemporalAddress] = a.TemporalAddress
-	}
-	if a.TemporalNamespace != "" {
-		env[v1alpha1.EnvTemporalNamespace] = a.TemporalNamespace
+	// Without these the sandbox has no route to the control plane, and the runner
+	// only logs how the command finished.
+	if a.ReportCompletion {
+		if in.WorkflowID != "" {
+			env[v1alpha1.EnvWorkflowID] = in.WorkflowID
+		}
+		if a.TemporalAddress != "" {
+			env[v1alpha1.EnvTemporalAddress] = a.TemporalAddress
+		}
+		if a.TemporalNamespace != "" {
+			env[v1alpha1.EnvTemporalNamespace] = a.TemporalNamespace
+		}
 	}
 	return env, nil
 }

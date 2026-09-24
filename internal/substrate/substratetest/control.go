@@ -49,6 +49,7 @@ type ControlServer struct {
 	atespaces  []string
 	actors     []string
 	actorState map[string]ateapipb.ActorState
+	actorTmpl  map[string]*ateapipb.ObjectRef
 	resumed    []string
 	suspended  []string
 	policies   []string
@@ -71,6 +72,7 @@ func NewControlServer(templates ...string) *ControlServer {
 		templates:  tmpl,
 		createdEnv: make(map[string]map[string]string),
 		actorState: make(map[string]ateapipb.ActorState),
+		actorTmpl:  make(map[string]*ateapipb.ObjectRef),
 		WorkerIP:   "10.244.1.42",
 	}
 }
@@ -150,12 +152,21 @@ func (s *ControlServer) CreateActor(ctx context.Context, req *ateapipb.CreateAct
 	}
 	name := req.GetActor().GetMetadata().GetName()
 	s.mu.Lock()
+	if _, exists := s.actorState[name]; exists {
+		s.mu.Unlock()
+		// Substrate binds an actor to the template it was created from, so a
+		// second create is rejected rather than rebinding the actor.
+		return nil, status.Errorf(codes.AlreadyExists, "actor %q already exists", name)
+	}
+	template := req.GetActor().GetActorTemplate()
 	s.actors = append(s.actors, name)
 	s.actorState[name] = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+	s.actorTmpl[name] = template
 	s.mu.Unlock()
 	return &ateapipb.Actor{
-		Metadata: &ateapipb.ResourceMetadata{Name: name},
-		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+		Metadata:      &ateapipb.ResourceMetadata{Name: name},
+		ActorTemplate: template,
+		Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
 	}, nil
 }
 
@@ -207,14 +218,16 @@ func (s *ControlServer) GetActor(ctx context.Context, req *ateapipb.GetActorRequ
 	name := req.GetActor().GetName()
 	s.mu.Lock()
 	state, ok := s.actorState[name]
+	template := s.actorTmpl[name]
 	workerIP := s.WorkerIP
 	s.mu.Unlock()
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "actor %q not found", name)
 	}
 	actor := &ateapipb.Actor{
-		Metadata: &ateapipb.ResourceMetadata{Name: name, Atespace: req.GetActor().GetAtespace()},
-		Status:   &ateapipb.ActorStatus{State: state},
+		Metadata:      &ateapipb.ResourceMetadata{Name: name, Atespace: req.GetActor().GetAtespace()},
+		ActorTemplate: template,
+		Status:        &ateapipb.ActorStatus{State: state},
 	}
 	if state == ateapipb.ActorState_ACTOR_STATE_RUNNING {
 		actor.Status.WorkerAssignment = &ateapipb.WorkerAssignment{
@@ -240,6 +253,7 @@ func (s *ControlServer) DeleteActor(ctx context.Context, req *ateapipb.DeleteAct
 	s.mu.Lock()
 	s.delActors = append(s.delActors, name)
 	delete(s.actorState, name)
+	delete(s.actorTmpl, name)
 	s.mu.Unlock()
 	return &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }

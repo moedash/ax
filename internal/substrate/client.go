@@ -276,11 +276,13 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 	}
 }
 
-// EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image and optional environment variables.
-func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
+// EnsureActorTemplateWithImage creates an ActorTemplate using the specified
+// container image and optional environment variables, and reports whether this
+// call is what created it.
+func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, targetAtespace, targetTemplate, image string, extraEnv ...map[string]string) (template *ateapipb.ActorTemplate, created bool, err error) {
 	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
 	if err == nil && existing != nil {
-		return existing, nil
+		return existing, false, nil
 	}
 
 	envMap := make(map[string]string)
@@ -290,22 +292,28 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 		}
 	}
 
-	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "")
 	req := &ateapipb.CreateActorTemplateRequest{
-		ActorTemplate: tmpl,
+		ActorTemplate: BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, ""),
 	}
-	created, err := c.control.CreateActorTemplate(ctx, req)
-	if err != nil && status.Code(err) != codes.AlreadyExists {
-		return nil, fmt.Errorf("creating actor template %s/%s: %w", targetAtespace, targetTemplate, err)
+	made, err := c.control.CreateActorTemplate(ctx, req)
+	if err == nil {
+		return made, true, nil
 	}
-	if created != nil {
-		return created, nil
+	if status.Code(err) != codes.AlreadyExists {
+		return nil, false, fmt.Errorf("creating actor template %s/%s: %w", targetAtespace, targetTemplate, err)
 	}
-	return c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
+	// Another worker got there first, so the template is not ours to roll back.
+	template, err = c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
+	return template, false, err
 }
 
-// EnsureActor creates an Actor in the specified atespace deriving from an ActorTemplate.
-func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateAtespace, templateName string) (*ateapipb.Actor, error) {
+// EnsureActor creates an Actor in the specified atespace deriving from an
+// ActorTemplate, and reports whether this call is what created it.
+//
+// Substrate binds an actor to the template it was created from, so a caller
+// that wants a different template has to replace the actor. The created flag
+// is what lets a caller tell "I made this" from "this was already here".
+func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateAtespace, templateName string) (actor *ateapipb.Actor, created bool, err error) {
 	req := &ateapipb.CreateActorRequest{
 		Actor: &ateapipb.Actor{
 			Metadata: &ateapipb.ResourceMetadata{
@@ -318,52 +326,57 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 			},
 		},
 	}
-	actor, err := c.control.CreateActor(ctx, req)
-	if err != nil {
-		if status.Code(err) == codes.AlreadyExists {
-			existing, getErr := c.control.GetActor(ctx, &ateapipb.GetActorRequest{
-				Actor: &ateapipb.ObjectRef{
-					Atespace: atespace,
-					Name:     actorName,
-				},
-			})
-			if getErr == nil && existing != nil {
-				state := existing.GetStatus().GetState()
-				if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
-					slog.Warn("existing actor is crashed, deleting and recreating", "actor", actorName)
-					_, _ = c.control.DeleteActor(ctx, &ateapipb.DeleteActorRequest{
-						Actor: &ateapipb.ObjectRef{
-							Atespace: atespace,
-							Name:     actorName,
-						},
-						AnyState: true,
-					})
-					state = ateapipb.ActorState_ACTOR_STATE_DELETING
-				}
-				if state == ateapipb.ActorState_ACTOR_STATE_DELETING {
-					// Wait briefly for previous actor deletion to finalize before recreating
-					for i := 0; i < 20; i++ {
-						select {
-						case <-ctx.Done():
-							return nil, ctx.Err()
-						case <-time.After(500 * time.Millisecond):
-						}
-						actor, err = c.control.CreateActor(ctx, req)
-						if err == nil {
-							return actor, nil
-						}
-						if status.Code(err) != codes.AlreadyExists {
-							break
-						}
-					}
-					return nil, fmt.Errorf("actor %s/%s is still deleting; please retry", atespace, actorName)
-				}
-			}
-			return existing, getErr
-		}
-		return nil, fmt.Errorf("creating actor %s/%s: %w", atespace, actorName, err)
+	actor, err = c.control.CreateActor(ctx, req)
+	if err == nil {
+		return actor, true, nil
 	}
-	return actor, nil
+	if status.Code(err) != codes.AlreadyExists {
+		return nil, false, fmt.Errorf("creating actor %s/%s: %w", atespace, actorName, err)
+	}
+
+	existing, getErr := c.control.GetActor(ctx, &ateapipb.GetActorRequest{
+		Actor: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     actorName,
+		},
+	})
+	if getErr != nil || existing == nil {
+		return existing, false, getErr
+	}
+
+	state := existing.GetStatus().GetState()
+	if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
+		slog.Warn("existing actor is crashed, deleting and recreating", "actor", actorName)
+		_, _ = c.control.DeleteActor(ctx, &ateapipb.DeleteActorRequest{
+			Actor: &ateapipb.ObjectRef{
+				Atespace: atespace,
+				Name:     actorName,
+			},
+			AnyState: true,
+		})
+		state = ateapipb.ActorState_ACTOR_STATE_DELETING
+	}
+	if state != ateapipb.ActorState_ACTOR_STATE_DELETING {
+		return existing, false, nil
+	}
+
+	// Wait briefly for the previous actor's deletion to finalize before
+	// recreating; Substrate rejects the create until it has.
+	for i := 0; i < 20; i++ {
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+		actor, err = c.control.CreateActor(ctx, req)
+		if err == nil {
+			return actor, true, nil
+		}
+		if status.Code(err) != codes.AlreadyExists {
+			break
+		}
+	}
+	return nil, false, fmt.Errorf("actor %s/%s is still deleting; please retry", atespace, actorName)
 }
 
 // GetActor fetches an actor. A missing actor is reported as a nil actor rather
