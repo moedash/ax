@@ -168,7 +168,7 @@ func (r *taskRun) handleDelete(ctx workflow.Context) error {
 	r.deleting = true
 	r.teardownFailed = false
 	r.request()
-	r.syncPhase()
+	r.syncPhase(ctx)
 
 	if err := workflow.Await(ctx, func() bool {
 		return r.deleted || r.teardownFailures > failures

@@ -253,7 +253,7 @@ func newTaskRun(ctx workflow.Context, in TaskWorkflowInput) (*taskRun, error) {
 	if r.status.GetPhase() == v1alpha1.PhaseCompleted || r.status.ExitCode != nil {
 		r.completed = true
 	}
-	r.syncPhase()
+	r.syncPhase(ctx)
 	return r, nil
 }
 
@@ -292,7 +292,7 @@ func (r *taskRun) converge(ctx workflow.Context) {
 	if err != nil {
 		workflow.GetLogger(ctx).Error("task did not converge", "task", r.key(), "error", err)
 	}
-	r.syncPhase()
+	r.syncPhase(ctx)
 }
 
 func (r *taskRun) reconcile(ctx workflow.Context) error {
@@ -586,7 +586,7 @@ func (r *taskRun) resync(ctx workflow.Context) {
 		if r.status.GetWorkerIp() != "" && !r.conditionTrue(v1alpha1.ConditionWorkspaceReady) {
 			r.workspaceProbed = false
 		}
-		r.syncPhase()
+		r.syncPhase(ctx)
 		return
 	}
 	r.converge(ctx)
@@ -632,7 +632,7 @@ func (r *taskRun) teardown(ctx workflow.Context) error {
 	}
 
 	r.deleted = true
-	r.syncPhase()
+	r.syncPhase(ctx)
 	return nil
 }
 
@@ -645,7 +645,7 @@ func (r *taskRun) failTeardown(ctx workflow.Context, message string) {
 	r.teardownFailures++
 	r.teardownMessage = message
 	r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TeardownFailed", message)
-	r.syncPhase()
+	r.syncPhase(ctx)
 }
 
 // releaseOnCancel tears the sandbox down when the workflow is cancelled. The
@@ -696,7 +696,8 @@ func (r *taskRun) key() string {
 // syncPhase derives the reported phase from the run's state. Deriving it in one
 // place is what keeps a task from reporting Running after its command exited,
 // or Completed while its sandbox is suspended.
-func (r *taskRun) syncPhase() {
+func (r *taskRun) syncPhase(ctx workflow.Context) {
+	before := r.status.GetPhase()
 	switch {
 	case r.deleting || r.deleted:
 		r.status.Phase = v1alpha1.PhaseTerminating
@@ -717,6 +718,32 @@ func (r *taskRun) syncPhase() {
 	default:
 		r.status.Phase = v1alpha1.PhasePending
 	}
+
+	// Visibility carries the phase so that listing tasks does not mean asking
+	// every one of them what it is doing.
+	if r.status.GetPhase() != before {
+		r.upsertSearchAttributes(ctx)
+	}
+}
+
+// upsertSearchAttributes publishes the parts of a task that visibility answers
+// for: where it lives, what it is doing, and the configuration it binds.
+func (r *taskRun) upsertSearchAttributes(ctx workflow.Context) {
+	workspaces := make([]string, 0, len(r.desired.Workspaces))
+	for _, ref := range r.desired.Task.GetSpec().WorkspaceRefs() {
+		if ref.GetName() != "" {
+			workspaces = append(workspaces, ref.GetName())
+		}
+	}
+	err := workflow.UpsertTypedSearchAttributes(ctx,
+		AtespaceKey.ValueSet(r.desired.Task.GetMetadata().GetAtespace()),
+		PhaseKey.ValueSet(r.status.GetPhase()),
+		GatewayKey.ValueSet(r.desired.Task.GetSpec().GetGateway().GetName()),
+		WorkspacesKey.ValueSet(workspaces),
+	)
+	if err != nil {
+		workflow.GetLogger(ctx).Warn("could not publish the task to visibility", "task", r.key(), "error", err)
+	}
 }
 
 // recordCompletion stores how the task command finished. The sandbox stays up
@@ -730,7 +757,7 @@ func (r *taskRun) recordCompletion(ctx workflow.Context, in CompleteInput) {
 		message = fmt.Sprintf("Task command exited with code %d", exitCode)
 	}
 	r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "CommandExited", message)
-	r.syncPhase()
+	r.syncPhase(ctx)
 	workflow.GetLogger(ctx).Info("task command exited", "task", r.key(), "exitCode", exitCode)
 }
 

@@ -75,15 +75,34 @@ const (
 	ErrTypeUnsupportedVersion = "UnsupportedProvisioningVersion"
 )
 
-// AtespaceSearchAttribute is the custom search attribute that carries a task's
-// atespace, so tasks can be listed per atespace from visibility. It has to
-// exist in the namespace before a worker starts:
+// Search attributes carry enough of a task in visibility to list tasks, and to
+// find the tasks that bind a piece of configuration, without asking each task
+// in turn. They have to exist in the namespace before a worker starts:
 //
-//	temporal operator search-attribute create --name AxAtespace --type Keyword
-const AtespaceSearchAttribute = "AxAtespace"
+//	temporal operator search-attribute create \
+//	  --name AxAtespace  --type Keyword \
+//	  --name AxPhase     --type Keyword \
+//	  --name AxGateway   --type Keyword \
+//	  --name AxWorkspaces --type KeywordList
+const (
+	// AtespaceSearchAttribute carries a task's atespace.
+	AtespaceSearchAttribute = "AxAtespace"
+	// PhaseSearchAttribute carries status.phase, so a listing reads a task's
+	// state from visibility rather than from the task itself.
+	PhaseSearchAttribute = "AxPhase"
+	// GatewaySearchAttribute carries the gateway a task binds, if any.
+	GatewaySearchAttribute = "AxGateway"
+	// WorkspacesSearchAttribute carries the workspaces a task binds.
+	WorkspacesSearchAttribute = "AxWorkspaces"
+)
 
-// AtespaceKey is the typed handle for AtespaceSearchAttribute.
-var AtespaceKey = temporal.NewSearchAttributeKeyKeyword(AtespaceSearchAttribute)
+// Typed handles for the search attributes above.
+var (
+	AtespaceKey   = temporal.NewSearchAttributeKeyKeyword(AtespaceSearchAttribute)
+	PhaseKey      = temporal.NewSearchAttributeKeyKeyword(PhaseSearchAttribute)
+	GatewayKey    = temporal.NewSearchAttributeKeyKeyword(GatewaySearchAttribute)
+	WorkspacesKey = temporal.NewSearchAttributeKeyKeywordList(WorkspacesSearchAttribute)
+)
 
 // TaskWorkflowID returns the workflow ID of a task. It is the task's business
 // key, so the API server can address a task without keeping a mapping and two

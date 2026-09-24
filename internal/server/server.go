@@ -35,7 +35,8 @@ import (
 )
 
 // defaultWatchPollInterval is how often WatchTask asks a task for its state.
-const defaultWatchPollInterval = time.Second
+// Each interval is one query per open watch, so it is not free.
+const defaultWatchPollInterval = 2 * time.Second
 
 // Options configures the API server.
 type Options struct {

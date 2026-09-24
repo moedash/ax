@@ -90,7 +90,7 @@ func TestRecordHistory(t *testing.T) {
 		t.Fatalf("connecting to %s: %v", address, err)
 	}
 	defer temporalClient.Close()
-	ensureSearchAttribute(ctx, t, temporalClient)
+	ensureSearchAttributes(ctx, t, temporalClient)
 
 	taskQueue := "ax-tasks-replay"
 	w := worker.New(temporalClient, taskQueue, worker.Options{})
@@ -164,18 +164,21 @@ func httpSandbox(t *testing.T) string {
 	return listener.Addr().String()
 }
 
-// ensureSearchAttribute creates the attribute task listing needs. A namespace
-// that already has it is left alone.
-func ensureSearchAttribute(ctx context.Context, t *testing.T, c sdkclient.Client) {
+// ensureSearchAttributes creates the attributes a task publishes about itself.
+// A namespace that already has them is left alone.
+func ensureSearchAttributes(ctx context.Context, t *testing.T, c sdkclient.Client) {
 	t.Helper()
 	_, err := c.OperatorService().AddSearchAttributes(ctx, &operatorservice.AddSearchAttributesRequest{
 		Namespace: "default",
 		SearchAttributes: map[string]enumspb.IndexedValueType{
-			workflows.AtespaceSearchAttribute: enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			workflows.AtespaceSearchAttribute:   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			workflows.PhaseSearchAttribute:      enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			workflows.GatewaySearchAttribute:    enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			workflows.WorkspacesSearchAttribute: enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST,
 		},
 	})
 	if err != nil {
-		t.Logf("search attribute %s: %v", workflows.AtespaceSearchAttribute, err)
+		t.Logf("search attributes: %v", err)
 	}
 }
 

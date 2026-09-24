@@ -59,7 +59,7 @@ func main() {
 	flag.StringVar(&temporalAddress, "temporal-address", defaultTemporalAddress, "Temporal frontend address")
 	flag.StringVar(&temporalNamespace, "temporal-namespace", defaultTemporalNamespace, "Temporal namespace")
 	flag.StringVar(&taskQueue, "task-queue", defaultTaskQueue, "Task queue task workflows are started on")
-	flag.DurationVar(&watchInterval, "watch-interval", time.Second, "How often WatchTask asks a task for its state")
+	flag.DurationVar(&watchInterval, "watch-interval", 2*time.Second, "How often WatchTask asks a task for its state. Each interval is one query per open watch.")
 	flag.Parse()
 
 	if env := os.Getenv("ADDR"); env != "" {

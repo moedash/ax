@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -29,6 +28,7 @@ import (
 	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
 	"google.golang.org/protobuf/proto"
 
@@ -193,8 +193,10 @@ func (c *Client) isGone(ctx context.Context, workflowID string, task *v1alpha1.T
 	return described.GetWorkflowExecutionInfo().GetStatus() != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, nil
 }
 
-// List returns the tasks of an atespace. Visibility answers which tasks exist,
-// and each one is then asked for its own state.
+// List returns the tasks of an atespace from visibility alone. A listing must
+// not cost a round trip to every task it lists, so the workflow publishes what
+// a listing shows and this reads it back. The worker address is the one thing
+// not carried there; GetTask has it.
 func (c *Client) List(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error) {
 	if limit <= 0 {
 		limit = 50
@@ -211,59 +213,61 @@ func (c *Client) List(ctx context.Context, atespace string, limit, offset int64)
 		return []*v1alpha1.Task{}, nil
 	}
 	executions = executions[offset:]
+	if int64(len(executions)) > limit {
+		executions = executions[:limit]
+	}
 
 	tasks := make([]*v1alpha1.Task, 0, len(executions))
 	for _, execution := range executions {
-		task, ok := c.describe(ctx, execution)
-		if !ok {
-			continue
-		}
-		tasks = append(tasks, task)
-		if int64(len(tasks)) == limit {
-			break
-		}
+		tasks = append(tasks, listedTask(execution))
 	}
 	return tasks, nil
 }
 
-// describe asks one listed task for its state. A task that has ended in the
-// meantime is left out; a task whose worker does not answer is listed with what
-// visibility knows about it, so a listing stays useful when workers are down.
-func (c *Client) describe(ctx context.Context, execution *workflowpb.WorkflowExecutionInfo) (*v1alpha1.Task, bool) {
-	id := execution.GetExecution().GetWorkflowId()
-
-	queryCtx, cancel := context.WithTimeout(ctx, c.queryWait)
-	defer cancel()
-
-	value, err := c.client.QueryWorkflow(queryCtx, id, "", workflows.QueryTask)
-	if err != nil {
-		if errors.Is(mapError(err), orchestration.ErrTaskNotFound) {
-			return nil, false
-		}
-		slog.Warn("could not read task state", "workflow", id, "error", err)
-		return listedTask(id), true
-	}
-	var task v1alpha1.Task
-	if err := value.Get(&task); err != nil {
-		slog.Warn("could not decode task state", "workflow", id, "error", err)
-		return listedTask(id), true
-	}
-	return &task, true
-}
-
-// listedTask is what a listing shows for a task that exists but cannot speak
-// for itself. Its workflow ID is its atespace and name.
-func listedTask(workflowID string) *v1alpha1.Task {
-	atespace, name, found := strings.Cut(workflowID, "/")
-	if !found {
-		atespace, name = v1alpha1.DefaultAtespace, workflowID
+// listedTask rebuilds a task from the fields visibility carries about it.
+func listedTask(execution *workflowpb.WorkflowExecutionInfo) *v1alpha1.Task {
+	atespace, name := splitWorkflowID(execution.GetExecution().GetWorkflowId())
+	if published := keyword(execution, workflows.AtespaceSearchAttribute); published != "" {
+		atespace = published
 	}
 	return &v1alpha1.Task{
 		ApiVersion: v1alpha1.APIVersion,
 		Kind:       v1alpha1.KindTask,
-		Metadata:   &v1alpha1.ObjectMeta{Name: name, Atespace: atespace},
-		Status:     &v1alpha1.TaskStatus{},
+		Metadata: &v1alpha1.ObjectMeta{
+			Name:              name,
+			Atespace:          atespace,
+			CreationTimestamp: execution.GetStartTime(),
+		},
+		Status: &v1alpha1.TaskStatus{
+			Phase: keyword(execution, workflows.PhaseSearchAttribute),
+			// An actor carries the name of the task that owns it.
+			Actor: name,
+		},
 	}
+}
+
+// splitWorkflowID takes a task's atespace and name back out of its workflow
+// ID. Neither may contain a slash, and the separator is the last one so that
+// an ID from somewhere else does not come apart in a surprising way.
+func splitWorkflowID(workflowID string) (atespace, name string) {
+	slash := strings.LastIndex(workflowID, "/")
+	if slash < 0 {
+		return v1alpha1.DefaultAtespace, workflowID
+	}
+	return workflowID[:slash], workflowID[slash+1:]
+}
+
+// keyword reads one keyword search attribute off a listed execution.
+func keyword(execution *workflowpb.WorkflowExecutionInfo, name string) string {
+	payload, ok := execution.GetSearchAttributes().GetIndexedFields()[name]
+	if !ok {
+		return ""
+	}
+	var value string
+	if err := converter.GetDefaultDataConverter().FromPayload(payload, &value); err != nil {
+		return ""
+	}
+	return value
 }
 
 // listQuery builds the visibility query for an atespace, or for every atespace

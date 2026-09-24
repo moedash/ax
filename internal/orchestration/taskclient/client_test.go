@@ -29,6 +29,7 @@ import (
 	sdkclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/google/ax/internal/orchestration"
 	"github.com/google/ax/internal/orchestration/workflows"
@@ -63,7 +64,7 @@ type fakeTemporal struct {
 
 	// executions is what ListWorkflow answers with, and listQueries records the
 	// queries it was asked.
-	executions  []string
+	executions  []listedExecution
 	listQueries []string
 }
 
@@ -112,12 +113,41 @@ func (f *fakeTemporal) DescribeWorkflowExecution(ctx context.Context, workflowID
 func (f *fakeTemporal) ListWorkflow(ctx context.Context, request *workflowservice.ListWorkflowExecutionsRequest) (*workflowservice.ListWorkflowExecutionsResponse, error) {
 	f.listQueries = append(f.listQueries, request.GetQuery())
 	resp := &workflowservice.ListWorkflowExecutionsResponse{}
-	for _, id := range f.executions {
-		resp.Executions = append(resp.Executions, &workflowpb.WorkflowExecutionInfo{
-			Execution: &commonpb.WorkflowExecution{WorkflowId: id},
-		})
+	for _, execution := range f.executions {
+		resp.Executions = append(resp.Executions, execution.info())
 	}
 	return resp, nil
+}
+
+// listedExecution is one row of visibility, with the search attributes a task
+// workflow publishes about itself.
+type listedExecution struct {
+	id       string
+	atespace string
+	phase    string
+	started  time.Time
+}
+
+func (e listedExecution) info() *workflowpb.WorkflowExecutionInfo {
+	fields := map[string]*commonpb.Payload{}
+	for name, value := range map[string]string{
+		workflows.AtespaceSearchAttribute: e.atespace,
+		workflows.PhaseSearchAttribute:    e.phase,
+	} {
+		if value == "" {
+			continue
+		}
+		payload, err := converter.GetDefaultDataConverter().ToPayload(value)
+		if err != nil {
+			panic(err)
+		}
+		fields[name] = payload
+	}
+	return &workflowpb.WorkflowExecutionInfo{
+		Execution:        &commonpb.WorkflowExecution{WorkflowId: e.id},
+		StartTime:        timestamppb.New(e.started),
+		SearchAttributes: &commonpb.SearchAttributes{IndexedFields: fields},
+	}
 }
 
 type fakeUpdateHandle struct {
@@ -397,11 +427,15 @@ func TestListQuery(t *testing.T) {
 	}
 }
 
-// A task nothing answers for is still listed, with what visibility knows.
-func TestListFallsBackToVisibility(t *testing.T) {
+// A listing reads what the task published about itself. Asking every task in
+// turn is what this replaces.
+func TestListReadsVisibilityWithoutAskingEachTask(t *testing.T) {
+	started := time.Date(2026, 9, 24, 8, 0, 0, 0, time.UTC)
 	fake := &fakeTemporal{
-		executions: []string{"team-a/job"},
-		queryErr:   serviceerror.NewFailedPrecondition("no poller seen for task queue recently, worker may be down"),
+		executions: []listedExecution{
+			{id: "team-a/job", atespace: "team-a", phase: v1alpha1.PhaseRunning, started: started},
+			{id: "team-a/other", atespace: "team-a", phase: v1alpha1.PhaseSuspended, started: started},
+		},
 	}
 	client := newTestClient(fake)
 
@@ -409,30 +443,62 @@ func TestListFallsBackToVisibility(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List failed: %v", err)
 	}
-	if len(tasks) != 1 {
-		t.Fatalf("expected one task, got %d", len(tasks))
+	if len(tasks) != 2 {
+		t.Fatalf("expected two tasks, got %d", len(tasks))
 	}
-	if tasks[0].GetMetadata().GetName() != "job" || tasks[0].GetMetadata().GetAtespace() != "team-a" {
-		t.Errorf("expected the name and atespace from the workflow ID, got %v", tasks[0].GetMetadata())
+	if fake.queries != 0 {
+		t.Errorf("expected no task to be asked, got %d queries", fake.queries)
 	}
-	if tasks[0].GetStatus().GetPhase() != "" {
-		t.Errorf("expected no status for a task that could not be asked, got %q", tasks[0].GetStatus().GetPhase())
+
+	first := tasks[0]
+	if first.GetMetadata().GetName() != "job" || first.GetMetadata().GetAtespace() != "team-a" {
+		t.Errorf("expected the task's identity, got %v", first.GetMetadata())
+	}
+	if first.GetMetadata().GetCreationTimestamp().AsTime() != started {
+		t.Errorf("expected the start time as the creation time, got %v", first.GetMetadata().GetCreationTimestamp())
+	}
+	if first.GetStatus().GetPhase() != v1alpha1.PhaseRunning {
+		t.Errorf("expected the published phase, got %q", first.GetStatus().GetPhase())
+	}
+	if first.GetStatus().GetActor() != "job" {
+		t.Errorf("an actor carries the task's name, got %q", first.GetStatus().GetActor())
+	}
+	if tasks[1].GetStatus().GetPhase() != v1alpha1.PhaseSuspended {
+		t.Errorf("expected the second task's phase, got %q", tasks[1].GetStatus().GetPhase())
 	}
 }
 
-// A task that ended between the listing and the query is left out.
-func TestListLeavesOutATaskThatIsGone(t *testing.T) {
-	fake := &fakeTemporal{
-		executions: []string{"team-a/job"},
-		queryErr:   serviceerror.NewNotFound("no such workflow"),
-	}
+// Paging happens over what visibility returned.
+func TestListPages(t *testing.T) {
+	fake := &fakeTemporal{executions: []listedExecution{
+		{id: "team-a/one", atespace: "team-a", phase: v1alpha1.PhaseRunning},
+		{id: "team-a/two", atespace: "team-a", phase: v1alpha1.PhaseRunning},
+		{id: "team-a/three", atespace: "team-a", phase: v1alpha1.PhaseRunning},
+	}}
 	client := newTestClient(fake)
 
-	tasks, err := client.List(context.Background(), "team-a", 50, 0)
+	tasks, err := client.List(context.Background(), "team-a", 1, 1)
 	if err != nil {
 		t.Fatalf("List failed: %v", err)
 	}
-	if len(tasks) != 0 {
-		t.Fatalf("expected no tasks, got %d", len(tasks))
+	if len(tasks) != 1 || tasks[0].GetMetadata().GetName() != "two" {
+		t.Fatalf("expected the second task alone, got %v", tasks)
+	}
+}
+
+// A workflow ID that is not a task's key still yields something sensible.
+func TestSplitWorkflowID(t *testing.T) {
+	atespace, name := splitWorkflowID("team-a/job")
+	if atespace != "team-a" || name != "job" {
+		t.Errorf("expected team-a and job, got %q and %q", atespace, name)
+	}
+	atespace, name = splitWorkflowID("job")
+	if atespace != v1alpha1.DefaultAtespace || name != "job" {
+		t.Errorf("expected the default atespace and job, got %q and %q", atespace, name)
+	}
+	// The separator is the last slash, so a name is never cut short.
+	atespace, name = splitWorkflowID("a/b/c")
+	if atespace != "a/b" || name != "c" {
+		t.Errorf("expected a/b and c, got %q and %q", atespace, name)
 	}
 }
