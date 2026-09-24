@@ -254,8 +254,8 @@ func TestApplySendsTheUpdateWithAStart(t *testing.T) {
 	if fake.updateOptions.UpdateName != workflows.UpdateApply {
 		t.Errorf("expected the apply update, got %q", fake.updateOptions.UpdateName)
 	}
-	if fake.updateOptions.WaitForStage != sdkclient.WorkflowUpdateStageAccepted {
-		t.Errorf("expected to wait for acceptance, got %v", fake.updateOptions.WaitForStage)
+	if fake.updateOptions.WaitForStage != sdkclient.WorkflowUpdateStageCompleted {
+		t.Errorf("expected to wait for the result, got %v", fake.updateOptions.WaitForStage)
 	}
 }
 

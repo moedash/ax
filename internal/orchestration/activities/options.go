@@ -90,6 +90,29 @@ func ActorOptions() workflow.ActivityOptions {
 	}
 }
 
+// minObserveBudget keeps the resync read useful even when the interval is set
+// very low.
+const minObserveBudget = 30 * time.Second
+
+// ObserveOptions configures the read a resync does. Its budget stays under the
+// resync interval: a read that kept retrying for the whole provisioning budget
+// would hold up the interval it was meant to fit inside.
+func ObserveOptions(resync time.Duration) workflow.ActivityOptions {
+	budget := resync / 2
+	if budget < minObserveBudget {
+		budget = minObserveBudget
+	}
+	attempt := controlCallTimeout
+	if budget < attempt {
+		attempt = budget
+	}
+	return workflow.ActivityOptions{
+		StartToCloseTimeout:    attempt,
+		ScheduleToCloseTimeout: budget,
+		RetryPolicy:            retryPolicy(),
+	}
+}
+
 // ResumeOptions configures placing an actor on a worker. The call blocks while
 // Substrate restores the sandbox, so it reports liveness and can be cancelled.
 func ResumeOptions() workflow.ActivityOptions {

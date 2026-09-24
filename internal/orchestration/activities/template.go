@@ -18,9 +18,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"hash"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -32,42 +35,95 @@ import (
 // ActorTemplate name.
 const templateDigestBytes = 4
 
-// TaskTemplateName derives a task's ActorTemplate name from a digest of the
-// specs that end up inside the container: the task itself and every workspace
-// it binds. A spec change yields a new template, and an unchanged spec always
-// yields the same one, which is what makes template provisioning idempotent.
+// TaskTemplateName derives a task's ActorTemplate name from the specs that end
+// up inside the container: the task itself and every workspace it binds. A spec
+// change yields a new template, and an unchanged spec always yields the same
+// one, which is what makes template provisioning idempotent.
 //
-// The digest deliberately covers only the desired state. Task status and
-// resolved credentials are excluded so that a status update or a rotated API
-// key does not strand a fresh template on every reconcile.
+// The digest is taken over named fields rather than over marshaled bytes. Wire
+// bytes are a property of the protobuf library, so an upgrade of it could
+// rename every template in a cluster and strand every sandbox.
+//
+// The digest deliberately covers only the desired state. Task status, the
+// suspend flag, and resolved credentials are excluded so that a status update
+// or a rotated key does not strand a fresh template on every reconcile.
 func TaskTemplateName(task *v1alpha1.Task, workspaces []*v1alpha1.Workspace) string {
-	h := sha256.New()
-	_, _ = h.Write([]byte(task.GetSpec().GetImage()))
-	_, _ = h.Write(digestBytes(SandboxSpec(task)))
-	for _, ws := range workspaces {
-		if ws == nil {
-			continue
-		}
-		_, _ = h.Write(digestBytes(ws))
+	d := &digest{h: sha256.New()}
+	spec := SandboxSpec(task).GetSpec()
+
+	d.field("image", spec.GetImage())
+	for _, arg := range spec.GetCommand() {
+		d.field("command", arg)
 	}
-	return fmt.Sprintf("%s-tmpl-%x", task.GetMetadata().GetName(), h.Sum(nil)[:templateDigestBytes])
+	for _, env := range spec.GetEnv() {
+		d.field("env", env.GetName(), env.GetValue())
+	}
+	d.field("debug", strconv.FormatBool(spec.GetDebug()))
+	d.field("cpu", spec.GetResources().GetRequests().GetCpu(), spec.GetResources().GetLimits().GetCpu())
+	d.field("memory", spec.GetResources().GetRequests().GetMemory(), spec.GetResources().GetLimits().GetMemory())
+	for _, ref := range spec.WorkspaceRefs() {
+		d.field("workspace", ref.GetName(), ref.GetPath(), ref.GetGoal())
+	}
+	for _, ws := range workspaces {
+		digestWorkspace(d, ws)
+	}
+	return fmt.Sprintf("%s-tmpl-%x", task.GetMetadata().GetName(), d.sum()[:templateDigestBytes])
+}
+
+// digestWorkspace covers what a workspace puts inside the sandbox.
+func digestWorkspace(d *digest, ws *v1alpha1.Workspace) {
+	if ws == nil {
+		return
+	}
+	spec := ws.GetSpec()
+	d.field("workspace-spec", ws.GetMetadata().GetName())
+	for _, repo := range spec.GetGit() {
+		d.field("git", repo.GetName(), repo.GetRepo(), repo.GetBranch(), repo.GetDir(), strconv.Itoa(int(repo.GetDepth())))
+	}
+	for _, registry := range spec.GetMcp().GetRegistries() {
+		d.field("mcp-registry", registry.GetProvider(), registry.GetProject(), registry.GetQuery())
+		for _, server := range registry.GetServers() {
+			digestMCPServer(d, server)
+		}
+	}
+	for _, server := range spec.GetMcp().GetServers() {
+		digestMCPServer(d, server)
+	}
+	for _, registry := range spec.GetSkills().GetRegistries() {
+		d.field("skill-registry", registry.GetProvider(), registry.GetProject(), registry.GetQuery())
+	}
+	d.field("skills-path", spec.GetSkills().GetPath())
+}
+
+func digestMCPServer(d *digest, server *v1alpha1.MCPServer) {
+	values := []string{server.GetName(), server.GetEndpoint(), server.GetCommand()}
+	values = append(values, server.GetArgs()...)
+	d.field("mcp-server", values...)
+}
+
+// digest writes named values in the order they are given, with separators that
+// cannot appear in a field name, so no two different specs hash alike.
+type digest struct {
+	h hash.Hash
+}
+
+func (d *digest) field(name string, values ...string) {
+	_, _ = io.WriteString(d.h, name)
+	for _, value := range values {
+		_, _ = io.WriteString(d.h, "\x00")
+		_, _ = io.WriteString(d.h, value)
+	}
+	_, _ = io.WriteString(d.h, "\n")
+}
+
+func (d *digest) sum() []byte {
+	return d.h.Sum(nil)
 }
 
 // TaskTemplatePattern matches every ActorTemplate name TaskTemplateName can
 // produce for the given task, across all spec revisions.
 func TaskTemplatePattern(taskName string) *regexp.Regexp {
 	return regexp.MustCompile(fmt.Sprintf("^%s-tmpl-[0-9a-f]{%d}$", regexp.QuoteMeta(taskName), 2*templateDigestBytes))
-}
-
-// digestBytes renders a message as stable bytes. Deterministic marshaling is
-// required because the digest is computed in workflow code and has to survive a
-// replay on another worker.
-func digestBytes(m proto.Message) []byte {
-	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(m)
-	if err != nil {
-		return nil
-	}
-	return data
 }
 
 // SandboxSpec returns the part of a task that decides what its sandbox is made

@@ -105,11 +105,9 @@ func runTask(ctx workflow.Context, cfg Config, in TaskWorkflowInput) error {
 	logger := workflow.GetLogger(ctx)
 	logger.Info("task workflow started", "task", r.key(), "phase", r.status.GetPhase())
 
-	if v := workflow.GetVersion(ctx, provisioningChangeID, provisioningVersion, provisioningVersion); v != provisioningVersion {
-		return temporal.NewNonRetryableApplicationError(
-			fmt.Sprintf("task was provisioned by version %d, which this worker does not support", v),
-			ErrTypeUnsupportedVersion, nil)
-	}
+	// Recorded on every run. There is one version of the provisioning sequence
+	// so far, and this is the hook a later one branches on.
+	_ = workflow.GetVersion(ctx, provisioningChangeID, workflow.DefaultVersion, provisioningVersion)
 
 	// A cancelled task is a deleted task: the sandbox must not outlive the
 	// workflow that owns it.
@@ -160,7 +158,7 @@ func runTask(ctx workflow.Context, cfg Config, in TaskWorkflowInput) error {
 				return err
 			}
 			if !requested {
-				r.resync(ctx)
+				r.resync(ctx, cfg)
 			}
 		}
 
@@ -552,12 +550,12 @@ func (r *taskRun) settleWorkspace(ctx workflow.Context) {
 // resync checks the sandbox against what the workflow believes about it. A
 // crashed or vanished actor is provisioned again, and a rescheduled one has its
 // worker address corrected.
-func (r *taskRun) resync(ctx workflow.Context) {
+func (r *taskRun) resync(ctx workflow.Context, cfg Config) {
 	if r.deleting || r.provisioned == nil {
 		return
 	}
 	logger := workflow.GetLogger(ctx)
-	observeCtx := workflow.WithActivityOptions(ctx, activities.ProvisionOptions())
+	observeCtx := workflow.WithActivityOptions(ctx, activities.ObserveOptions(cfg.ResyncInterval))
 
 	var observed activities.ActorObservation
 	if err := workflow.ExecuteActivity(observeCtx, acts.ObserveActor, r.actorRef()).Get(observeCtx, &observed); err != nil {
@@ -586,10 +584,9 @@ func (r *taskRun) resync(ctx workflow.Context) {
 		if r.status.GetWorkerIp() != "" && !r.conditionTrue(v1alpha1.ConditionWorkspaceReady) {
 			r.workspaceProbed = false
 		}
-		r.syncPhase(ctx)
-		return
 	}
-	r.converge(ctx)
+	// Whatever changed here is driven in by the next turn of the loop.
+	r.syncPhase(ctx)
 }
 
 // forgetSandbox drops what the workflow believes about the sandbox so the next

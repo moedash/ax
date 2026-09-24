@@ -70,9 +70,6 @@ const (
 	ErrTypeTeardownFailed = "TeardownFailed"
 	// ErrTypeInvalidTask rejects an update whose task spec cannot be applied.
 	ErrTypeInvalidTask = "InvalidTask"
-	// ErrTypeUnsupportedVersion is returned when a task's recorded provisioning
-	// version is no longer supported by this worker.
-	ErrTypeUnsupportedVersion = "UnsupportedProvisioningVersion"
 )
 
 // Search attributes carry enough of a task in visibility to list tasks, and to

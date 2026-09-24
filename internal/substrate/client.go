@@ -340,8 +340,13 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 			Name:     actorName,
 		},
 	})
-	if getErr != nil || existing == nil {
-		return existing, false, getErr
+	if getErr != nil {
+		return nil, false, fmt.Errorf("reading the existing actor %s/%s: %w", atespace, actorName, getErr)
+	}
+	if existing == nil {
+		// Substrate said the actor exists and then did not produce it. A caller
+		// cannot act on that, and it clears on a retry if it was a race.
+		return nil, false, fmt.Errorf("actor %s/%s exists but could not be read", atespace, actorName)
 	}
 
 	state := existing.GetStatus().GetState()

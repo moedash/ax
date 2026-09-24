@@ -100,9 +100,11 @@ func (c *Client) Apply(ctx context.Context, desired *workflows.TaskDesiredState)
 	handle, err := c.client.UpdateWithStartWorkflow(waitCtx, sdkclient.UpdateWithStartWorkflowOptions{
 		StartWorkflowOperation: start,
 		UpdateOptions: sdkclient.UpdateWorkflowOptions{
-			UpdateName:   workflows.UpdateApply,
-			Args:         []any{desired},
-			WaitForStage: sdkclient.WorkflowUpdateStageAccepted,
+			UpdateName: workflows.UpdateApply,
+			Args:       []any{desired},
+			// Waiting for the result rather than for acceptance is one round
+			// trip instead of two; the wait above is what bounds it either way.
+			WaitForStage: sdkclient.WorkflowUpdateStageCompleted,
 		},
 	})
 	if err != nil {
@@ -140,6 +142,11 @@ func (c *Client) acceptedTask(ctx context.Context, workflowID string, task *v1al
 	out.ApiVersion = v1alpha1.APIVersion
 	out.Kind = v1alpha1.KindTask
 	out.Status = &v1alpha1.TaskStatus{Phase: v1alpha1.PhasePending}
+	if out.Metadata != nil {
+		// The workflow owns the creation time and has not answered yet, so
+		// there is nothing truthful to put here.
+		out.Metadata.CreationTimestamp = nil
+	}
 	return out, nil
 }
 
@@ -330,9 +337,11 @@ func (c *Client) change(ctx context.Context, atespace, name, update string) (*v1
 	defer cancel()
 
 	handle, err := c.client.UpdateWorkflow(waitCtx, sdkclient.UpdateWorkflowOptions{
-		WorkflowID:   workflows.TaskWorkflowID(atespaceOf(atespace), name),
-		UpdateName:   update,
-		WaitForStage: sdkclient.WorkflowUpdateStageAccepted,
+		WorkflowID: workflows.TaskWorkflowID(atespaceOf(atespace), name),
+		UpdateName: update,
+		// The answer is the point of the call, so wait for it rather than for
+		// acceptance and then a second round trip.
+		WaitForStage: sdkclient.WorkflowUpdateStageCompleted,
 	})
 	if err != nil {
 		return nil, c.changeError(ctx, waitCtx, atespace, name, err)

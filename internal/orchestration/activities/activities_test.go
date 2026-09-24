@@ -581,3 +581,54 @@ func TestFailedPreconditionIsPermanentElsewhere(t *testing.T) {
 			activities.ErrTypePermanent, appErr.Type(), !appErr.NonRetryable())
 	}
 }
+
+// The template name is a digest of named fields, so it does not move when a
+// library changes how it encodes them, and it does move when the spec does.
+func TestTaskTemplateNameCoversTheSpecFields(t *testing.T) {
+	base := testTask()
+	name := activities.TaskTemplateName(base, nil)
+
+	changes := map[string]func(*v1alpha1.Task, []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace){
+		"command": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
+			task.Spec.Command = []string{"/bin/other"}
+			return task, ws
+		},
+		"env value": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
+			task.Spec.Env[0].Value = "something else"
+			return task, ws
+		},
+		"env name": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
+			task.Spec.Env[0].Name = "OTHER"
+			return task, ws
+		},
+		"debug": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
+			task.Spec.Debug = true
+			return task, ws
+		},
+		"workspace binding": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
+			task.Spec.Workspaces = []*v1alpha1.WorkspaceRef{{Name: "repo", Goal: "build it"}}
+			return task, ws
+		},
+		"workspace git": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
+			return task, []*v1alpha1.Workspace{{
+				Metadata: &v1alpha1.ObjectMeta{Name: "repo"},
+				Spec: &v1alpha1.WorkspaceSpec{
+					Git: []*v1alpha1.GitRepo{{Name: "repo", Repo: "https://github.com/example/repo", Branch: "main"}},
+				},
+			}}
+		},
+	}
+	for what, change := range changes {
+		t.Run(what, func(t *testing.T) {
+			task, workspaces := change(testTask(), nil)
+			if got := activities.TaskTemplateName(task, workspaces); got == name {
+				t.Errorf("a change to the %s must yield a new template name, both are %q", what, got)
+			}
+		})
+	}
+
+	// The same spec, built again, still names the same template.
+	if got := activities.TaskTemplateName(testTask(), nil); got != name {
+		t.Errorf("expected %q for the same spec, got %q", name, got)
+	}
+}

@@ -45,9 +45,11 @@ var (
 // atespace and name, which is also the workflow's ID, so no mapping is kept
 // anywhere.
 type Tasks interface {
-	// Apply creates or updates a task and returns it as it stands once the
-	// sandbox is in the state the spec asks for. Workspace setup inside the
-	// sandbox continues in the background.
+	// Apply creates or updates a task. It answers with the task as it stands
+	// once the sandbox is in the state the spec asks for, or, when no worker
+	// answers within the client's wait, with the task it accepted in the
+	// Pending phase. Workspace setup inside the sandbox continues in the
+	// background either way.
 	Apply(ctx context.Context, desired *workflows.TaskDesiredState) (*v1alpha1.Task, error)
 	// Get returns one task, or ErrTaskNotFound.
 	Get(ctx context.Context, atespace, name string) (*v1alpha1.Task, error)

@@ -47,14 +47,23 @@ func (a *Activities) AwaitWorkspaceReady(ctx context.Context, in WorkspaceReadyI
 	if interval <= 0 {
 		interval = defaultPollInterval
 	}
+
+	// A retry continues the wait the first attempt started. Without this, an
+	// activity that is retried a few times waits several times its budget.
 	deadline := time.Now().Add(in.Timeout)
+	if activity.HasHeartbeatDetails(ctx) {
+		var started time.Time
+		if err := activity.GetHeartbeatDetails(ctx, &started); err == nil && !started.IsZero() {
+			deadline = started
+		}
+	}
 
 	for {
 		if a.probeWorkspace(ctx, in) {
 			logger.Info("workspace setup finished", "actor", in.Actor.Name, "workerIP", in.WorkerIP)
 			return true, nil
 		}
-		activity.RecordHeartbeat(ctx, in.WorkerIP)
+		activity.RecordHeartbeat(ctx, deadline)
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
