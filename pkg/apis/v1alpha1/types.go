@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -298,9 +299,43 @@ func (s *TaskSpec) WorkspacePaths() []string {
 	return paths
 }
 
+// maxLabelLength is the longest an RFC 1123 DNS label may be.
+const maxLabelLength = 63
+
+// dnsLabel matches an RFC 1123 DNS label: lower case letters, digits, and
+// dashes, starting and ending with a letter or a digit.
+var dnsLabel = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+
+// ValidateMetadata reports the first problem with a resource's identity. Names
+// and atespaces are DNS labels because they end up in Substrate resource names,
+// in HTTP headers, and in the queries the control plane builds, so anything
+// else has no business reaching those places.
+//
+// An empty atespace is accepted: the API server defaults it.
+func ValidateMetadata(meta *ObjectMeta) error {
+	name := meta.GetName()
+	if name == "" {
+		return fmt.Errorf("metadata.name is required")
+	}
+	if len(name) > maxLabelLength || !dnsLabel.MatchString(name) {
+		return fmt.Errorf("metadata.name %q must be a DNS label: lower case letters, digits, and dashes, at most %d characters", name, maxLabelLength)
+	}
+	atespace := meta.GetAtespace()
+	if atespace == "" {
+		return nil
+	}
+	if len(atespace) > maxLabelLength || !dnsLabel.MatchString(atespace) {
+		return fmt.Errorf("metadata.atespace %q must be a DNS label: lower case letters, digits, and dashes, at most %d characters", atespace, maxLabelLength)
+	}
+	return nil
+}
+
 // ValidateTask reports the first problem with a task's spec that would make it
 // impossible to run correctly. It is called by the API server before saving.
 func ValidateTask(t *Task) error {
+	if err := ValidateMetadata(t.GetMetadata()); err != nil {
+		return err
+	}
 	spec := t.GetSpec()
 	if spec == nil {
 		return nil

@@ -447,7 +447,10 @@ func TestValidateTask(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := v1alpha1.ValidateTask(&v1alpha1.Task{Spec: tt.spec})
+			err := v1alpha1.ValidateTask(&v1alpha1.Task{
+				Metadata: &v1alpha1.ObjectMeta{Name: "task"},
+				Spec:     tt.spec,
+			})
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -495,5 +498,62 @@ spec:
 	}
 	if !proto.Equal(&task, &back) {
 		t.Errorf("round trip changed the task:\n%s", out)
+	}
+}
+
+func TestValidateMetadata(t *testing.T) {
+	tests := []struct {
+		name    string
+		meta    *v1alpha1.ObjectMeta
+		wantErr string
+	}{
+		{name: "name and atespace", meta: &v1alpha1.ObjectMeta{Name: "task-1", Atespace: "team-a"}},
+		{name: "atespace defaulted later", meta: &v1alpha1.ObjectMeta{Name: "task-1"}},
+		{name: "no metadata", wantErr: "metadata.name is required"},
+		{name: "no name", meta: &v1alpha1.ObjectMeta{Atespace: "default"}, wantErr: "metadata.name is required"},
+		{
+			name:    "quote in name",
+			meta:    &v1alpha1.ObjectMeta{Name: "task' OR '1'='1"},
+			wantErr: "must be a DNS label",
+		},
+		{
+			name:    "quote in atespace",
+			meta:    &v1alpha1.ObjectMeta{Name: "task", Atespace: "default' OR '1'='1"},
+			wantErr: "must be a DNS label",
+		},
+		{
+			name:    "upper case name",
+			meta:    &v1alpha1.ObjectMeta{Name: "Task"},
+			wantErr: "must be a DNS label",
+		},
+		{
+			name:    "leading dash",
+			meta:    &v1alpha1.ObjectMeta{Name: "-task"},
+			wantErr: "must be a DNS label",
+		},
+		{
+			name:    "slash in name",
+			meta:    &v1alpha1.ObjectMeta{Name: "team/task"},
+			wantErr: "must be a DNS label",
+		},
+		{
+			name:    "too long",
+			meta:    &v1alpha1.ObjectMeta{Name: strings.Repeat("a", 64)},
+			wantErr: "at most 63 characters",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := v1alpha1.ValidateMetadata(tt.meta)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
 	}
 }

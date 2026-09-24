@@ -80,7 +80,7 @@ func (c *Client) Apply(ctx context.Context, desired *workflows.TaskDesiredState)
 		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
 		WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
 		TypedSearchAttributes:    temporal.NewSearchAttributes(workflows.AtespaceKey.ValueSet(atespace)),
-	}, workflows.TaskWorkflow, workflows.TaskWorkflowInput{Desired: desired})
+	}, workflows.TaskWorkflowType, workflows.TaskWorkflowInput{Desired: desired})
 
 	// An update is only accepted by a worker, so the wait is bounded: the task
 	// has been created either way, and a control plane with no workers must not
@@ -257,12 +257,26 @@ func listedTask(workflowID string) *v1alpha1.Task {
 	}
 }
 
+// listQuery builds the visibility query for an atespace, or for every atespace
+// when it is empty. The value is quoted even though the API server only accepts
+// atespaces that are DNS labels, so the query cannot be steered by its input
+// whatever validation upstream does.
+func listQuery(atespace string) string {
+	query := fmt.Sprintf("WorkflowType = '%s' AND ExecutionStatus = 'Running'", workflows.TaskWorkflowType)
+	if atespace == "" || atespace == "*" {
+		return query
+	}
+	return query + fmt.Sprintf(" AND %s = %s", workflows.AtespaceSearchAttribute, quote(atespaceOf(atespace)))
+}
+
+// quote renders a value as a visibility query string literal.
+func quote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
 // listExecutions walks visibility until it has at least want executions.
 func (c *Client) listExecutions(ctx context.Context, atespace string, want int64) ([]*workflowpb.WorkflowExecutionInfo, error) {
-	query := fmt.Sprintf("WorkflowType = '%s' AND ExecutionStatus = 'Running'", workflows.TaskWorkflowType)
-	if atespace != "" && atespace != "*" {
-		query += fmt.Sprintf(" AND %s = '%s'", workflows.AtespaceSearchAttribute, atespaceOf(atespace))
-	}
+	query := listQuery(atespace)
 
 	var (
 		out   []*workflowpb.WorkflowExecutionInfo

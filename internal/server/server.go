@@ -349,6 +349,9 @@ func (s *Server) UpdateGateway(ctx context.Context, req *v1alpha1.UpdateGatewayR
 	if req == nil || req.Gateway == nil {
 		return nil, status.Error(codes.InvalidArgument, "gateway required")
 	}
+	if err := v1alpha1.ValidateMetadata(req.Gateway.GetMetadata()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 	req.Gateway.Metadata = defaultMetadata(req.Gateway.Metadata, func(atespace, name string) *v1alpha1.ObjectMeta {
 		existing, err := s.store.GetGateway(ctx, atespace, name)
 		if err != nil {
@@ -412,6 +415,9 @@ func (s *Server) UpdateWorkspace(ctx context.Context, req *v1alpha1.UpdateWorksp
 	if req == nil || req.Workspace == nil {
 		return nil, status.Error(codes.InvalidArgument, "workspace required")
 	}
+	if err := v1alpha1.ValidateMetadata(req.Workspace.GetMetadata()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 	req.Workspace.Metadata = defaultMetadata(req.Workspace.Metadata, func(atespace, name string) *v1alpha1.ObjectMeta {
 		existing, err := s.store.GetWorkspace(ctx, atespace, name)
 		if err != nil {
@@ -474,6 +480,9 @@ func (s *Server) ListModels(ctx context.Context, req *v1alpha1.ListModelsRequest
 func (s *Server) UpdateModel(ctx context.Context, req *v1alpha1.UpdateModelRequest) (*v1alpha1.Model, error) {
 	if req == nil || req.Model == nil {
 		return nil, status.Error(codes.InvalidArgument, "model required")
+	}
+	if err := v1alpha1.ValidateMetadata(req.Model.GetMetadata()); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	req.Model.Metadata = defaultMetadata(req.Model.Metadata, func(atespace, name string) *v1alpha1.ObjectMeta {
 		existing, err := s.store.GetModel(ctx, atespace, name)
