@@ -913,3 +913,33 @@ func (s *taskWorkflowSuite) TestATeardownThatFailsKeepsTheTask() {
 	s.Len(s.calls.get(&s.calls.delActors), 2, "the delete was tried again")
 	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.delTmpl), "templates go once the actor has")
 }
+
+// A task started together with the update that carries its spec waits for it
+// rather than assuming one.
+func (s *taskWorkflowSuite) TestAStartWithNoSpecWaitsForTheApply() {
+	var applied *v1alpha1.Task
+	s.updateTask(time.Second, workflows.UpdateApply, "apply-1", &applied, testInput().Desired)
+	s.delete(2 * time.Second)
+
+	// The start carries nothing, which is what update-with-start sends.
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, workflows.TaskWorkflowInput{})
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.Require().NotNil(applied)
+	s.Equal("test-task", applied.GetMetadata().GetName())
+	s.Equal(v1alpha1.PhaseRunning, applied.GetStatus().GetPhase())
+	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.actors))
+}
+
+// A start that is never followed by its update does not sit there forever.
+func (s *taskWorkflowSuite) TestAStartWithNoSpecGivesUp() {
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, workflows.TaskWorkflowInput{})
+
+	s.True(s.env.IsWorkflowCompleted())
+	err := s.env.GetWorkflowError()
+	s.Require().Error(err)
+	var appErr *temporal.ApplicationError
+	s.Require().ErrorAs(err, &appErr)
+	s.Equal(workflows.ErrTypeInvalidTask, appErr.Type())
+	s.Empty(s.calls.get(&s.calls.atespaces), "nothing is provisioned for a task that never arrived")
+}

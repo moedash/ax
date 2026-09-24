@@ -89,7 +89,8 @@ func (c *Client) Apply(ctx context.Context, desired *workflows.TaskDesiredState)
 		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
 		WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
 		TypedSearchAttributes:    temporal.NewSearchAttributes(workflows.AtespaceKey.ValueSet(atespace)),
-	}, workflows.TaskWorkflowType, workflows.TaskWorkflowInput{Desired: desired})
+		// The update carries the spec, so the start does not repeat it.
+	}, workflows.TaskWorkflowType, workflows.TaskWorkflowInput{})
 
 	// An update is only accepted by a worker, so the wait is bounded: the task
 	// has been created either way, and a control plane with no workers must not

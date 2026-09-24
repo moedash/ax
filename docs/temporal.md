@@ -33,10 +33,10 @@ state, so it resumes where it stopped.
 | `SaveTask` plus a stream event | `UpdateWithStartWorkflow` with the `apply` update |
 | `XREADGROUP` loop in `ax-controller` | Temporal worker polling the `ax-tasks` task queue |
 | Reconcile function | `TaskWorkflow`, one execution per task |
-| Five Substrate calls in a row | Five activities, each idempotent, rolled back by a saga |
+| Five Substrate calls in a row | Five activities, each idempotent, with the four that create a sandbox rolled back by a saga |
 | In-reconcile 15 second readiness poll | A heartbeating activity that polls in the background |
 | `GetTask` from Redis | `task` query on the workflow |
-| `ListTasks` from a Redis index | Visibility query on the `AxAtespace` search attribute |
+| `ListTasks` from a Redis index | Visibility alone, over the attributes a task publishes about itself |
 | `spec.suspend` flipped in Redis | `suspend` and `resume` updates |
 | Two-phase delete through Redis | `delete` update: teardown, then the workflow ends |
 | Exit code logged and dropped | `complete` update from the runner, recorded as `status.exitCode` |
@@ -107,6 +107,11 @@ and resuming are not spec changes and leave the sandbox alone.
 | Signal | `complete` | Same as the update | Nothing |
 | Query | `task` | none | Metadata, spec, and status |
 | Query | `status` | none | Status only |
+
+A task also publishes `AxAtespace`, `AxPhase`, `AxGateway` and `AxWorkspaces`
+as search attributes, updated whenever its phase or its bindings change. That
+is what makes a listing one call, and what makes "which tasks bind this
+gateway" a question with an answer.
 
 A workflow answers queries after it has closed, so a task that has been deleted
 would still describe itself. `GetTask` therefore treats a task that reports
@@ -289,6 +294,29 @@ Two tests guard determinism:
     go test ./internal/orchestration/workflows/ -run TestRecordHistory
   ```
 
+### Configuration is bound when a task is applied
+
+The API server resolves a task's gateway and workspaces at apply time and hands
+them to the workflow. That is what keeps the worker off the configuration
+store, and it means a later edit to a `Gateway` or a `Workspace` does not reach
+the tasks that already bind it. Those tasks keep the configuration they were
+given until they are applied again.
+
+Visibility knows which tasks are affected, because each one publishes what it
+binds:
+
+```bash
+temporal workflow list --query "WorkflowType = 'TaskWorkflow' AND AxGateway = 'default-gateway'"
+temporal workflow list --query "WorkflowType = 'TaskWorkflow' AND AxWorkspaces = 'golang'"
+```
+
+Re-applying them automatically is the obvious next step and is deliberately not
+done in the API server: one edit to a shared gateway can touch every task in a
+cluster, and a synchronous loop inside an RPC is the wrong shape for that. It
+belongs in a fan-out workflow of its own, started by `UpdateGateway` and
+`UpdateWorkspace`, that walks the same visibility query in pages and applies a
+rate limit. Until then, re-applying is the operator's call.
+
 ### The resync costs one read per task
 
 Every interval, every settled task reads its actor. At ten thousand tasks and
@@ -312,8 +340,12 @@ status.
 # 1. A Temporal dev server.
 temporal server start-dev
 
-# 2. The search attribute task listing needs, once per namespace.
-temporal operator search-attribute create --name AxAtespace --type Keyword
+# 2. The search attributes task listing needs, once per namespace.
+temporal operator search-attribute create \
+  --name AxAtespace   --type Keyword \
+  --name AxPhase      --type Keyword \
+  --name AxGateway    --type Keyword \
+  --name AxWorkspaces --type KeywordList
 
 # 3. Redis for the configuration kinds.
 docker run -p 6379:6379 redis:7-alpine
@@ -352,8 +384,13 @@ whole history, and its pending updates.
 - **Redis stays, for gateways, workspaces, and models.** It is no longer on the
   path of a running task, so losing it does not stop tasks from being provisioned
   or torn down.
-- **The `AxAtespace` search attribute must exist** in the namespace before a
-  worker starts, or starting a task fails.
+- **The search attributes must exist** in the namespace before a worker starts,
+  or starting a task fails: `AxAtespace`, `AxPhase` and `AxGateway` as Keyword,
+  `AxWorkspaces` as KeywordList.
+- **A listing no longer asks each task.** `ax get tasks` reads name, atespace,
+  phase and age from visibility, which is one call however many tasks there
+  are. The worker address is not carried there, so it shows only in
+  `ax get task` and `ax describe task`.
 - **Completion reporting is off by default.** `--sandbox-report-completion`
   turns it on, and `--sandbox-temporal-address` is the address task containers
   dial. The address defaults to `--temporal-address`, which is right when the

@@ -30,6 +30,7 @@ All submissions, including submissions by project members, require review. We us
 - **[`ko`](https://ko.build/)** (for building and deploying control plane images)
 - **Docker** or **Podman** (for building the Linux task-runner container image)
 - A Kubernetes cluster with [Agent Substrate](https://github.com/agent-substrate/substrate) installed
+- A reachable **Temporal** service, which runs every task. `temporal server start-dev` is enough for local work; see [Temporal orchestration](docs/temporal.md#running-it-locally).
 
 ### Building Binaries
 
@@ -81,7 +82,17 @@ make push-task-runner TASK_RUNNER_REPO=gcr.io/<your-project>/ax-task-runner
 
 ### Deploying to Kubernetes
 
-Deploy Redis, the Temporal worker, and the API server to your cluster in the `ax-system` namespace:
+Register the search attributes tasks are listed by, once per Temporal namespace:
+
+```bash
+temporal operator search-attribute create \
+  --name AxAtespace   --type Keyword \
+  --name AxPhase      --type Keyword \
+  --name AxGateway    --type Keyword \
+  --name AxWorkspaces --type KeywordList
+```
+
+Then deploy Redis, the Temporal worker, and the API server to your cluster in the `ax-system` namespace:
 
 ```bash
 make deploy AX_IMAGE_REPO=gcr.io/<your-project>/ax-images

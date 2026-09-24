@@ -35,6 +35,11 @@ const (
 	provisioningChangeID = "provisioning"
 	provisioningVersion  = 1
 
+	// firstApplyTimeout bounds how long a task started by an update waits for
+	// that update to bring its spec. Both travel in one request, so anything
+	// longer than this means the update never arrived.
+	firstApplyTimeout = time.Minute
+
 	// defaultResyncInterval is how often a settled task checks that its sandbox
 	// is still what the task says it should be. A sandbox can crash or be
 	// rescheduled without anyone telling AX, and nothing else would notice.
@@ -103,6 +108,18 @@ func runTask(ctx workflow.Context, cfg Config, in TaskWorkflowInput) error {
 	}
 
 	logger := workflow.GetLogger(ctx)
+	if r.desired == nil {
+		// Started together with the update that carries the spec. Nothing about
+		// this task is known until it lands.
+		applied, err := workflow.AwaitWithTimeout(ctx, firstApplyTimeout, func() bool { return r.desired != nil })
+		if err != nil {
+			return err
+		}
+		if !applied {
+			return temporal.NewNonRetryableApplicationError(
+				"no task spec was applied", ErrTypeInvalidTask, nil)
+		}
+	}
 	logger.Info("task workflow started", "task", r.key(), "phase", r.status.GetPhase())
 
 	// Recorded on every run. There is one version of the provisioning sequence
@@ -178,6 +195,8 @@ func runTask(ctx workflow.Context, cfg Config, in TaskWorkflowInput) error {
 // taskRun is the state of one task workflow execution. Only the workflow's own
 // coroutines touch it, so no locking is involved.
 type taskRun struct {
+	// workflowID names the task even before a spec has been applied to it.
+	workflowID string
 	// desired is what the task should be. Updates replace it.
 	desired *TaskDesiredState
 	// provisioned is the desired state the current sandbox was built from. A
@@ -218,30 +237,12 @@ type taskRun struct {
 // newTaskRun validates the input and puts the task into the shape the rest of
 // the workflow expects.
 func newTaskRun(ctx workflow.Context, in TaskWorkflowInput) (*taskRun, error) {
-	if in.Desired == nil || in.Desired.Task == nil {
-		return nil, temporal.NewNonRetryableApplicationError("task is required", ErrTypeInvalidTask, nil)
-	}
-	if in.Desired.Task.GetMetadata().GetName() == "" {
-		return nil, temporal.NewNonRetryableApplicationError("task name is required", ErrTypeInvalidTask, nil)
-	}
-	if err := v1alpha1.ValidateTask(in.Desired.Task); err != nil {
-		return nil, temporal.NewNonRetryableApplicationError(err.Error(), ErrTypeInvalidTask, nil)
-	}
-
-	desired := normalizeDesired(in.Desired)
 	r := &taskRun{
-		desired: desired,
-		status:  in.Status,
+		status:     in.Status,
+		workflowID: workflow.GetInfo(ctx).WorkflowExecution.ID,
 	}
 	if r.status == nil {
 		r.status = &v1alpha1.TaskStatus{}
-	}
-	// The actor carries the task's name so that the two are interchangeable, for
-	// example in the router's ate-target-actor header. Whatever a client put in
-	// status.actor is overwritten.
-	r.status.Actor = desired.Task.GetMetadata().GetName()
-	if r.status.Id == "" {
-		r.status.Id = fmt.Sprintf("task-%s-%d", desired.Task.GetMetadata().GetName(), workflow.Now(ctx).Unix())
 	}
 	if r.conditionTrue(v1alpha1.ConditionWorkspaceReady) {
 		// Workspace setup happens once per task and its result outlives suspends,
@@ -251,8 +252,49 @@ func newTaskRun(ctx workflow.Context, in TaskWorkflowInput) (*taskRun, error) {
 	if r.status.GetPhase() == v1alpha1.PhaseCompleted || r.status.ExitCode != nil {
 		r.completed = true
 	}
-	r.syncPhase(ctx)
+
+	// A task started by an update-with-start carries no spec here: the update
+	// is what brings it. A continued run brings its own.
+	if in.Desired == nil {
+		return r, nil
+	}
+	if err := r.adopt(ctx, in.Desired); err != nil {
+		return nil, err
+	}
 	return r, nil
+}
+
+// adopt takes a desired state as the task's own, normalizing it and settling
+// the identity that follows from it.
+func (r *taskRun) adopt(ctx workflow.Context, desired *TaskDesiredState) error {
+	if desired == nil || desired.Task == nil {
+		return temporal.NewNonRetryableApplicationError("task is required", ErrTypeInvalidTask, nil)
+	}
+	if desired.Task.GetMetadata().GetName() == "" {
+		return temporal.NewNonRetryableApplicationError("task name is required", ErrTypeInvalidTask, nil)
+	}
+	if err := v1alpha1.ValidateTask(desired.Task); err != nil {
+		return temporal.NewNonRetryableApplicationError(err.Error(), ErrTypeInvalidTask, nil)
+	}
+
+	created := r.desired.GetTask().GetMetadata().GetCreationTimestamp()
+	r.desired = normalizeDesired(desired)
+	if created != nil {
+		// A task is created once. Whatever a later apply carries, the creation
+		// time is the one the task started with.
+		r.desired.Task.Metadata.CreationTimestamp = created
+	}
+
+	// The actor carries the task's name so that the two are interchangeable, for
+	// example in the router's ate-target-actor header. Whatever a client put in
+	// status.actor is overwritten.
+	r.status.Actor = r.desired.Task.GetMetadata().GetName()
+	if r.status.Id == "" {
+		r.status.Id = fmt.Sprintf("task-%s-%d", r.status.Actor, workflow.Now(ctx).Unix())
+	}
+	r.syncPhase(ctx)
+	r.upsertSearchAttributes(ctx)
+	return nil
 }
 
 // normalizeDesired fills in the defaults a task manifest may leave out, so the
@@ -679,6 +721,14 @@ func (r *taskRun) continueInput() TaskWorkflowInput {
 	}
 }
 
+// GetTask makes a desired state safe to read before one has been applied.
+func (d *TaskDesiredState) GetTask() *v1alpha1.Task {
+	if d == nil {
+		return nil
+	}
+	return d.Task
+}
+
 func (r *taskRun) actorRef() activities.ActorRef {
 	return activities.ActorRef{
 		Atespace: r.desired.Task.GetMetadata().GetAtespace(),
@@ -687,6 +737,9 @@ func (r *taskRun) actorRef() activities.ActorRef {
 }
 
 func (r *taskRun) key() string {
+	if r.desired == nil {
+		return r.workflowID
+	}
 	return TaskWorkflowID(r.desired.Task.GetMetadata().GetAtespace(), r.desired.Task.GetMetadata().GetName())
 }
 
@@ -726,6 +779,9 @@ func (r *taskRun) syncPhase(ctx workflow.Context) {
 // upsertSearchAttributes publishes the parts of a task that visibility answers
 // for: where it lives, what it is doing, and the configuration it binds.
 func (r *taskRun) upsertSearchAttributes(ctx workflow.Context) {
+	if r.desired == nil {
+		return
+	}
 	workspaces := make([]string, 0, len(r.desired.Workspaces))
 	for _, ref := range r.desired.Task.GetSpec().WorkspaceRefs() {
 		if ref.GetName() != "" {
@@ -782,7 +838,7 @@ func (r *taskRun) statusSnapshot() *v1alpha1.TaskStatus {
 // taskSnapshot returns the task as the API serves it: the desired state the
 // workflow is working towards, with the status it has reached.
 func (r *taskRun) taskSnapshot() *v1alpha1.Task {
-	task := cloneTask(r.desired.Task)
+	task := cloneTask(r.desired.GetTask())
 	task.ApiVersion = v1alpha1.APIVersion
 	task.Kind = v1alpha1.KindTask
 	task.Status = r.statusSnapshot()

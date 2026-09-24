@@ -14,11 +14,13 @@ The unit is deliberately small. An agent is not one process that runs to complet
 
 | Condition | True when |
 |---|---|
-| `WorkspaceReady` | Every workspace has finished setting up. Stays True afterwards. |
+| `WorkspaceReady` | Every workspace has finished setting up. Stays True until the sandbox is replaced. |
 | `GatewayReady` | The gateway's network policies were applied to the sandbox. |
 | `Ready` | The task is running and `WorkspaceReady` is True. This is the one to wait on. |
 
-Three transitions are worth knowing. Suspending a task sets `Ready` to False with reason `TaskSuspended`; resuming sets it back. When the task's command exits, the task becomes `Completed` and `status.exitCode` carries the command's exit status, while the sandbox stays up so you can still look inside it. Deleting a task moves it to `Terminating` while its sandbox is torn down, then removes the record entirely. `ax delete` blocks until that has happened.
+`Ready` is also False, with the reason saying which, when the task is suspended (`TaskSuspended`), when its command has exited (`CommandExited`), when the sandbox could not be provisioned (`ActorCreationFailed` and friends), and when a delete could not release the sandbox (`TeardownFailed`).
+
+Four transitions are worth knowing. Suspending a task sets `Ready` to False with reason `TaskSuspended`; resuming sets it back. When the task's command exits, the task becomes `Completed` and `status.exitCode` carries the command's exit status, while the sandbox stays up so you can still look inside it. Applying a changed spec replaces the sandbox, because Agent Substrate binds an actor to the template it was created from: the task goes back through `WorkspaceReady` False, and whatever the old sandbox had in `/workspace` is gone. Deleting a task moves it to `Terminating` while its sandbox is torn down, then removes the record entirely. `ax delete` blocks until that has happened; a teardown that cannot finish leaves the task there, reporting `Failed`, so that it can be deleted again.
 
 ## Workspace
 
@@ -31,6 +33,19 @@ A `Workspace` populates the filesystem and tool landscape. Declare it once, bind
 - **Skill registries** and the path where skills are materialized.
 
 A binding can also carry a `goal`, a plain-language description of the environment the task needs. On first boot the runner hands that goal to an agent that finishes the setup, for example installing a toolchain or dependencies, so the task's own command starts in a ready environment.
+
+### Configuration is bound when a task is applied
+
+A task's `Gateway` and `Workspace`s are read when the task is applied and handed
+to it then. Editing one of those resources afterwards does not reach the tasks
+that already bind it: re-apply the task to pick the change up.
+
+Which tasks those are is a question visibility can answer:
+
+```bash
+temporal workflow list --query "WorkflowType = 'TaskWorkflow' AND AxGateway = 'default-gateway'"
+temporal workflow list --query "WorkflowType = 'TaskWorkflow' AND AxWorkspaces = 'golang'"
+```
 
 ## Gateway
 

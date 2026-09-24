@@ -72,11 +72,15 @@ This puts the `ax` binary in `$(go env GOPATH)/bin`. Make sure that directory is
 You need a Kubernetes cluster, [`ko`](https://ko.build/) (`brew install ko`), a container registry your cluster can pull from, a reachable Agent Substrate Control API (in-cluster default: `api.ate-system.svc.cluster.local:443`), and a Temporal service (in-cluster default: `temporal-frontend.temporal.svc.cluster.local:7233`).
 
 ```bash
-temporal operator search-attribute create --name AxAtespace --type Keyword
+temporal operator search-attribute create \
+  --name AxAtespace   --type Keyword \
+  --name AxPhase      --type Keyword \
+  --name AxGateway    --type Keyword \
+  --name AxWorkspaces --type KeywordList
 make deploy AX_IMAGE_REPO=<your-registry>
 ```
 
-The search attribute is a one-time setup per Temporal namespace; task listing uses it. `make deploy` then deploys Redis, which holds the gateways, workspaces, and models, and builds and deploys the control plane images with `ko`. Everything lands in the `ax-system` namespace.
+Those search attributes are a one-time setup per Temporal namespace: a task publishes its atespace, phase, and bindings into them, which is how listing works. `make deploy` then deploys Redis, which holds the gateways, workspaces, and models, and builds and deploys the control plane images with `ko`. Everything lands in the `ax-system` namespace.
 
 ### 3. Run your first task
 
