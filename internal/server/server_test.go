@@ -16,6 +16,7 @@ package server_test
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -32,8 +33,7 @@ import (
 )
 
 func TestServerHealthzHTTP(t *testing.T) {
-	memStore := memory.NewStore()
-	srv := server.NewServer(memStore)
+	srv := server.NewServer(memory.NewStore(), newFakeTasks(), server.Options{})
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -57,7 +57,9 @@ func TestServerHealthzHTTP(t *testing.T) {
 
 func TestServerGRPC(t *testing.T) {
 	memStore := memory.NewStore()
-	srv := server.NewServer(memStore)
+	tasks := newFakeTasks()
+	tasks.ready = true
+	srv := server.NewServer(memStore, tasks, server.Options{WatchPollInterval: 10 * time.Millisecond})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -243,8 +245,9 @@ func TestServerGRPC(t *testing.T) {
 	}
 
 	// 8. Delete operations
-	// Task deletion is two-phase: the RPC marks the task Terminating and the
-	// controller removes the record after tearing down the actor.
+	// Deleting a task is asynchronous: the RPC is accepted, the task reports
+	// Terminating while its sandbox is torn down, and the record disappears once
+	// that has finished.
 	if _, err := client.DeleteTask(ctx, &v1alpha1.DeleteTaskRequest{Atespace: "default", Name: "grpc-task"}); err != nil {
 		t.Fatalf("DeleteTask failed: %v", err)
 	}
@@ -258,10 +261,8 @@ func TestServerGRPC(t *testing.T) {
 	if _, err := client.DeleteTask(ctx, &v1alpha1.DeleteTaskRequest{Atespace: "default", Name: "no-such-task"}); status.Code(err) != codes.NotFound {
 		t.Errorf("expected NotFound deleting a missing task, got %v", err)
 	}
-	// Stand in for the controller finishing cleanup.
-	if err := memStore.DeleteTask(ctx, "default", "grpc-task"); err != nil {
-		t.Fatalf("removing task record failed: %v", err)
-	}
+	// Stand in for the task workflow finishing its teardown.
+	tasks.finishDelete("default", "grpc-task")
 	if _, err := client.DeleteGateway(ctx, &v1alpha1.DeleteGatewayRequest{Atespace: "default", Name: "grpc-gw"}); err != nil {
 		t.Fatalf("DeleteGateway failed: %v", err)
 	}
@@ -280,7 +281,7 @@ func TestServerGRPC(t *testing.T) {
 }
 
 func TestUpdateTask_ValidatesWorkspaceBindings(t *testing.T) {
-	srv := server.NewServer(memory.NewStore())
+	srv := server.NewServer(memory.NewStore(), newFakeTasks(), server.Options{})
 	ctx := context.Background()
 
 	_, err := srv.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
@@ -301,5 +302,123 @@ func TestUpdateTask_ValidatesWorkspaceBindings(t *testing.T) {
 	}})
 	if err != nil {
 		t.Fatalf("expected a valid multi-workspace task to be accepted, got %v", err)
+	}
+}
+
+// The API server resolves what a task binds and hands it to the task's
+// workflow, so the worker never reads the configuration store.
+func TestUpdateTaskResolvesBindings(t *testing.T) {
+	memStore := memory.NewStore()
+	tasks := newFakeTasks()
+	srv := server.NewServer(memStore, tasks, server.Options{})
+	ctx := context.Background()
+
+	if err := memStore.SaveGateway(ctx, &v1alpha1.Gateway{
+		Metadata: &v1alpha1.ObjectMeta{Name: "gw", Atespace: "default"},
+		Spec: &v1alpha1.GatewaySpec{
+			Egress: &v1alpha1.EgressConfig{
+				Allowlist: &v1alpha1.EgressAllowlist{
+					Hosts: []*v1alpha1.HostRule{{Host: "github.com", Port: 443}},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("SaveGateway failed: %v", err)
+	}
+	if err := memStore.SaveWorkspace(ctx, &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "repo", Atespace: "default"},
+		Spec:     &v1alpha1.WorkspaceSpec{},
+	}); err != nil {
+		t.Fatalf("SaveWorkspace failed: %v", err)
+	}
+
+	if _, err := srv.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "bound"},
+		Spec: &v1alpha1.TaskSpec{
+			Gateway: &v1alpha1.GatewayRef{Name: "gw"},
+			// The second binding has no Workspace resource; the runner treats it as
+			// an empty directory, so the task is still applied.
+			Workspaces: []*v1alpha1.WorkspaceRef{{Name: "repo"}, {Name: "missing"}},
+		},
+	}}); err != nil {
+		t.Fatalf("UpdateTask failed: %v", err)
+	}
+
+	applied := tasks.lastApplied()
+	if applied == nil {
+		t.Fatal("expected the task to be applied")
+	}
+	if applied.Gateway.GetMetadata().GetName() != "gw" {
+		t.Errorf("expected the gateway to be resolved, got %v", applied.Gateway)
+	}
+	if len(applied.Workspaces) != 1 || applied.Workspaces[0].GetMetadata().GetName() != "repo" {
+		t.Errorf("expected one resolved workspace, got %v", applied.Workspaces)
+	}
+	if applied.Task.GetMetadata().GetAtespace() != "default" {
+		t.Errorf("expected the atespace to be defaulted, got %q", applied.Task.GetMetadata().GetAtespace())
+	}
+}
+
+// WatchTask asks the task for its state on an interval and emits what changed,
+// until the task can do work.
+func TestWatchTaskStreamsUntilReady(t *testing.T) {
+	memStore := memory.NewStore()
+	tasks := newFakeTasks()
+	srv := server.NewServer(memStore, tasks, server.Options{WatchPollInterval: 10 * time.Millisecond})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	httpServer := &http.Server{Handler: srv.Handler()}
+	httpServer.Protocols = new(http.Protocols)
+	httpServer.Protocols.SetHTTP1(true)
+	httpServer.Protocols.SetUnencryptedHTTP2(true)
+	go func() { _ = httpServer.Serve(ln) }()
+	defer httpServer.Close()
+
+	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to dial gRPC: %v", err)
+	}
+	defer conn.Close()
+
+	client := v1alpha1.NewAXClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if _, err := client.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "watched"},
+		Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+	}}); err != nil {
+		t.Fatalf("UpdateTask failed: %v", err)
+	}
+
+	stream, err := client.WatchTask(ctx, &v1alpha1.WatchTaskRequest{Atespace: "default", Name: "watched"})
+	if err != nil {
+		t.Fatalf("WatchTask failed: %v", err)
+	}
+	initial, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("WatchTask Recv failed: %v", err)
+	}
+	if initial.GetAction() != "INITIAL" {
+		t.Errorf("expected INITIAL, got %q", initial.GetAction())
+	}
+
+	tasks.markReady("default", "watched")
+	modified, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("WatchTask Recv failed: %v", err)
+	}
+	if modified.GetAction() != "MODIFIED" {
+		t.Errorf("expected MODIFIED, got %q", modified.GetAction())
+	}
+
+	// A ready task ends the watch.
+	if _, err := stream.Recv(); err != io.EOF {
+		t.Errorf("expected the stream to end once the task is ready, got %v", err)
 	}
 }

@@ -92,6 +92,10 @@ func TaskWorkflow(ctx workflow.Context, in TaskWorkflowInput) error {
 		if r.deleting {
 			break
 		}
+		// Workspace setup inside the sandbox takes as long as a maiden run takes,
+		// so it is waited for in the background: a caller asking for a change gets
+		// an answer as soon as the sandbox is in the state it asked for.
+		r.settleWorkspace(ctx)
 		if workflow.GetInfo(ctx).GetContinueAsNewSuggested() {
 			r.drainCompletions(ctx)
 			if !r.pending() {
@@ -142,10 +146,13 @@ type taskRun struct {
 
 	sandbox         sandboxState
 	workspaceProbed bool
-	completed       bool
-	failed          bool
-	deleting        bool
-	deleted         bool
+	// probing is set while the background workspace poll is running, so only one
+	// runs at a time.
+	probing   bool
+	completed bool
+	failed    bool
+	deleting  bool
+	deleted   bool
 
 	completions workflow.ReceiveChannel
 }
@@ -340,7 +347,7 @@ func (r *taskRun) activate(ctx workflow.Context) error {
 		}
 		r.sandbox = sandboxSuspended
 		r.status.WorkerIp = ""
-		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TaskSuspended", "Task is suspended")
+		r.syncReady(ctx)
 		logger.Info("task suspended", "task", r.key())
 		return nil
 	}
@@ -357,29 +364,16 @@ func (r *taskRun) activate(ctx workflow.Context) error {
 		logger.Info("task running", "task", r.key(), "workerIP", workerIP)
 	}
 
-	if !r.workspaceProbed && r.status.GetWorkerIp() != "" {
-		probeCtx := workflow.WithActivityOptions(ctx, activities.WorkspaceReadyOptions(activities.WorkspaceReadyTimeout))
-		var ready bool
-		err := workflow.ExecuteActivity(probeCtx, acts.AwaitWorkspaceReady, activities.WorkspaceReadyInput{
-			Actor:    actor,
-			WorkerIP: r.status.GetWorkerIp(),
-			Timeout:  activities.WorkspaceReadyTimeout,
-		}).Get(probeCtx, &ready)
-		if err != nil {
-			r.setCondition(ctx, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionFalse, "ProbeFailed", err.Error())
-			return err
-		}
-		r.workspaceProbed = true
-		if ready {
-			r.setCondition(ctx, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue, "SetupComplete",
-				fmt.Sprintf("Workspace setup completed at %s", r.status.GetWorkerIp()))
-		} else {
-			r.setCondition(ctx, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionFalse, "Initializing",
-				fmt.Sprintf("Workspace is still initializing at %s", r.status.GetWorkerIp()))
-		}
-	}
+	r.syncReady(ctx)
+	return nil
+}
 
+// syncReady derives the Ready condition. A task is ready only when its sandbox
+// is running and the workspace inside it has finished setting up.
+func (r *taskRun) syncReady(ctx workflow.Context) {
 	switch {
+	case r.sandbox == sandboxSuspended:
+		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TaskSuspended", "Task is suspended")
 	case r.completed:
 		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "CommandExited",
 			fmt.Sprintf("Task command exited with code %d", r.status.GetExitCode()))
@@ -390,7 +384,43 @@ func (r *taskRun) activate(ctx workflow.Context) error {
 		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "WorkspaceInitializing",
 			"Waiting for workspace setup to complete")
 	}
-	return nil
+}
+
+// settleWorkspace waits for the workspace inside the sandbox in its own
+// coroutine and asks the main loop for a pass once it knows the answer, so the
+// task's readiness catches up without anything blocking on the poll.
+func (r *taskRun) settleWorkspace(ctx workflow.Context) {
+	if r.workspaceProbed || r.probing || r.deleting || r.status.GetWorkerIp() == "" {
+		return
+	}
+	r.probing = true
+	in := activities.WorkspaceReadyInput{
+		Actor:    r.actorRef(),
+		WorkerIP: r.status.GetWorkerIp(),
+		Timeout:  activities.WorkspaceReadyTimeout,
+	}
+	workflow.Go(ctx, func(gctx workflow.Context) {
+		probeCtx := workflow.WithActivityOptions(gctx, activities.WorkspaceReadyOptions(in.Timeout))
+		var ready bool
+		err := workflow.ExecuteActivity(probeCtx, acts.AwaitWorkspaceReady, in).Get(probeCtx, &ready)
+		r.probing = false
+		switch {
+		case err != nil:
+			// A probe that cannot run leaves the task running and not ready. The
+			// next activation of the sandbox tries again.
+			workflow.GetLogger(gctx).Error("workspace probe failed", "task", r.key(), "error", err)
+			r.setCondition(gctx, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionFalse, "ProbeFailed", err.Error())
+		case ready:
+			r.workspaceProbed = true
+			r.setCondition(gctx, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue, "SetupComplete",
+				fmt.Sprintf("Workspace setup completed at %s", in.WorkerIP))
+		default:
+			r.workspaceProbed = true
+			r.setCondition(gctx, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionFalse, "Initializing",
+				fmt.Sprintf("Workspace is still initializing at %s", in.WorkerIP))
+		}
+		r.request()
+	})
 }
 
 // resync checks the sandbox against what the workflow believes about it. A

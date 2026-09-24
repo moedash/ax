@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Command ax-server serves the AX gRPC API. Task calls go to Temporal, which
+// owns every task's lifecycle; the configuration kinds tasks bind are kept in
+// Redis.
 package main
 
 import (
@@ -24,37 +27,70 @@ import (
 	"syscall"
 	"time"
 
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/log"
+
+	"github.com/google/ax/internal/orchestration/taskclient"
 	"github.com/google/ax/internal/server"
 	"github.com/google/ax/internal/store/redis"
 	goredis "github.com/redis/go-redis/v9"
 )
 
+const (
+	defaultTemporalAddress   = "localhost:7233"
+	defaultTemporalNamespace = "default"
+	defaultTaskQueue         = "ax-tasks"
+)
+
 func main() {
 	var (
-		listenAddr    string
-		redisAddr     string
-		redisPassword string
+		listenAddr        string
+		redisAddr         string
+		redisPassword     string
+		temporalAddress   string
+		temporalNamespace string
+		taskQueue         string
+		watchInterval     time.Duration
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
-	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address")
+	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address for the configuration kinds")
 	flag.StringVar(&redisPassword, "redis-password", "", "Redis password")
+	flag.StringVar(&temporalAddress, "temporal-address", defaultTemporalAddress, "Temporal frontend address")
+	flag.StringVar(&temporalNamespace, "temporal-namespace", defaultTemporalNamespace, "Temporal namespace")
+	flag.StringVar(&taskQueue, "task-queue", defaultTaskQueue, "Task queue task workflows are started on")
+	flag.DurationVar(&watchInterval, "watch-interval", time.Second, "How often WatchTask asks a task for its state")
 	flag.Parse()
 
-	if envAddr := os.Getenv("ADDR"); envAddr != "" {
-		listenAddr = envAddr
+	if env := os.Getenv("ADDR"); env != "" {
+		listenAddr = env
 	}
-	if envRedis := os.Getenv("REDIS_ADDR"); envRedis != "" {
-		redisAddr = envRedis
+	if env := os.Getenv("REDIS_ADDR"); env != "" {
+		redisAddr = env
 	}
-	if envPass := os.Getenv("REDIS_PASSWORD"); envPass != "" {
-		redisPassword = envPass
+	if env := os.Getenv("REDIS_PASSWORD"); env != "" {
+		redisPassword = env
+	}
+	if env := os.Getenv("TEMPORAL_ADDRESS"); env != "" {
+		temporalAddress = env
+	}
+	if env := os.Getenv("TEMPORAL_NAMESPACE"); env != "" {
+		temporalNamespace = env
+	}
+	if env := os.Getenv("AX_TASK_QUEUE"); env != "" {
+		taskQueue = env
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	slog.Info("starting ax-server", "listenAddr", listenAddr, "redisAddr", redisAddr)
+	slog.Info("starting ax-server",
+		"listenAddr", listenAddr,
+		"redisAddr", redisAddr,
+		"temporalAddress", temporalAddress,
+		"temporalNamespace", temporalNamespace,
+		"taskQueue", taskQueue,
+	)
 
 	rClient := goredis.NewClient(&goredis.Options{
 		Addr:     redisAddr,
@@ -62,8 +98,22 @@ func main() {
 	})
 	defer rClient.Close()
 
-	rStore := redis.NewStore(rClient, redis.Options{})
-	srv := server.NewServer(rStore)
+	temporalClient, err := client.Dial(client.Options{
+		HostPort:  temporalAddress,
+		Namespace: temporalNamespace,
+		Logger:    log.NewStructuredLogger(logger),
+	})
+	if err != nil {
+		slog.Error("failed to connect to temporal", "address", temporalAddress, "error", err)
+		os.Exit(1)
+	}
+	defer temporalClient.Close()
+
+	srv := server.NewServer(
+		redis.NewStore(rClient, redis.Options{}),
+		taskclient.New(temporalClient, taskQueue),
+		server.Options{WatchPollInterval: watchInterval},
+	)
 
 	httpServer := &http.Server{
 		Addr:    listenAddr,

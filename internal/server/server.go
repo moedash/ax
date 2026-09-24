@@ -17,29 +17,54 @@ package server
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
-	"github.com/google/ax/internal/store"
-	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/google/ax/internal/orchestration"
+	"github.com/google/ax/internal/orchestration/workflows"
+	"github.com/google/ax/internal/store"
+	"github.com/google/ax/pkg/apis/v1alpha1"
 )
 
-// Server provides the gRPC API for AX.
+// defaultWatchPollInterval is how often WatchTask asks a task for its state.
+const defaultWatchPollInterval = time.Second
+
+// Options configures the API server.
+type Options struct {
+	// WatchPollInterval is how often WatchTask asks a task for its state. Zero
+	// uses defaultWatchPollInterval.
+	WatchPollInterval time.Duration
+}
+
+// Server provides the gRPC API for AX. Tasks live in their workflows and the
+// configuration kinds live in the store, so the server reads each from where it
+// belongs.
 type Server struct {
 	v1alpha1.UnimplementedAXServer
-	store      store.Store
-	grpcServer *grpc.Server
+	store             store.Store
+	tasks             orchestration.Tasks
+	grpcServer        *grpc.Server
+	watchPollInterval time.Duration
 }
 
 // NewServer creates a new AX API server.
-func NewServer(s store.Store) *Server {
+func NewServer(s store.Store, tasks orchestration.Tasks, opts Options) *Server {
 	srv := &Server{
-		store:      s,
-		grpcServer: grpc.NewServer(),
+		store:             s,
+		tasks:             tasks,
+		grpcServer:        grpc.NewServer(),
+		watchPollInterval: opts.WatchPollInterval,
+	}
+	if srv.watchPollInterval <= 0 {
+		srv.watchPollInterval = defaultWatchPollInterval
 	}
 	v1alpha1.RegisterAXServer(srv.grpcServer, srv)
 	return srv
@@ -74,16 +99,10 @@ func (s *Server) GetTask(ctx context.Context, req *v1alpha1.GetTaskRequest) (*v1
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "missing request")
 	}
-	atespace := req.Atespace
-	if atespace == "" {
-		atespace = "default"
-	}
-	task, err := s.store.GetTask(ctx, atespace, req.Name)
+	atespace := atespaceOf(req.Atespace)
+	task, err := s.tasks.Get(ctx, atespace, req.Name)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "task %q not found in atespace %q", req.Name, atespace)
-		}
-		return nil, status.Errorf(codes.Internal, "getting task: %v", err)
+		return nil, taskError(err, atespace, req.Name)
 	}
 	return task, nil
 }
@@ -97,17 +116,20 @@ func (s *Server) ListTasks(ctx context.Context, req *v1alpha1.ListTasksRequest) 
 		if req.Limit > 0 {
 			limit = req.Limit
 		}
-		if req.Offset >= 0 {
+		if req.Offset > 0 {
 			offset = req.Offset
 		}
 	}
-	tasks, err := s.store.ListTasks(ctx, atespace, limit, offset)
+	tasks, err := s.tasks.List(ctx, atespace, limit, offset)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "listing tasks: %v", err)
 	}
 	return &v1alpha1.ListTasksResponse{Tasks: tasks}, nil
 }
 
+// UpdateTask creates or updates a task. The configuration the task binds is
+// resolved here and handed to the task's workflow, so the worker that runs it
+// never reads the configuration store.
 func (s *Server) UpdateTask(ctx context.Context, req *v1alpha1.UpdateTaskRequest) (*v1alpha1.Task, error) {
 	if req == nil || req.Task == nil {
 		return nil, status.Error(codes.InvalidArgument, "task required")
@@ -117,33 +139,34 @@ func (s *Server) UpdateTask(ctx context.Context, req *v1alpha1.UpdateTaskRequest
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	task.Metadata = defaultMetadata(task.Metadata, func(atespace, name string) *v1alpha1.ObjectMeta {
-		existing, err := s.store.GetTask(ctx, atespace, name)
+		existing, err := s.tasks.Get(ctx, atespace, name)
 		if err != nil {
 			return nil
 		}
 		return existing.GetMetadata()
 	})
-	if err := s.store.SaveTask(ctx, task); err != nil {
-		return nil, status.Errorf(codes.Internal, "saving task: %v", err)
+
+	desired, err := s.resolveTask(ctx, task)
+	if err != nil {
+		return nil, err
 	}
-	return task, nil
+	applied, err := s.tasks.Apply(ctx, desired)
+	if err != nil {
+		return nil, taskError(err, task.GetMetadata().GetAtespace(), task.GetMetadata().GetName())
+	}
+	return applied, nil
 }
 
 func (s *Server) DeleteTask(ctx context.Context, req *v1alpha1.DeleteTaskRequest) (*v1alpha1.DeleteTaskResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "missing request")
 	}
-	atespace := req.Atespace
-	if atespace == "" {
-		atespace = "default"
-	}
-	// Deletion is two-phase: mark the task Terminating and let the controller tear
-	// down the actor before the record is removed. Clients poll GetTask for NotFound.
-	if err := s.store.MarkTaskDeleting(ctx, atespace, req.Name); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "task %q not found in atespace %q", req.Name, atespace)
-		}
-		return nil, status.Errorf(codes.Internal, "deleting task: %v", err)
+	atespace := atespaceOf(req.Atespace)
+	// Deletion is asynchronous: the task moves to Terminating while its sandbox
+	// is torn down, and disappears once that has finished. Clients poll GetTask
+	// for NotFound.
+	if err := s.tasks.Delete(ctx, atespace, req.Name); err != nil {
+		return nil, taskError(err, atespace, req.Name)
 	}
 	return &v1alpha1.DeleteTaskResponse{}, nil
 }
@@ -152,23 +175,10 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "missing request")
 	}
-	atespace := req.Atespace
-	if atespace == "" {
-		atespace = "default"
-	}
-	task, err := s.store.GetTask(ctx, atespace, req.Name)
+	atespace := atespaceOf(req.Atespace)
+	task, err := s.tasks.Suspend(ctx, atespace, req.Name)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "task %q not found in atespace %q", req.Name, atespace)
-		}
-		return nil, status.Errorf(codes.Internal, "getting task: %v", err)
-	}
-	if task.Spec == nil {
-		task.Spec = &v1alpha1.TaskSpec{}
-	}
-	task.Spec.Suspend = true
-	if err := s.store.SaveTask(ctx, task); err != nil {
-		return nil, status.Errorf(codes.Internal, "suspending task: %v", err)
+		return nil, taskError(err, atespace, req.Name)
 	}
 	return task, nil
 }
@@ -177,64 +187,132 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "missing request")
 	}
-	atespace := req.Atespace
-	if atespace == "" {
-		atespace = "default"
-	}
-	task, err := s.store.GetTask(ctx, atespace, req.Name)
+	atespace := atespaceOf(req.Atespace)
+	task, err := s.tasks.Resume(ctx, atespace, req.Name)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, status.Errorf(codes.NotFound, "task %q not found in atespace %q", req.Name, atespace)
-		}
-		return nil, status.Errorf(codes.Internal, "getting task: %v", err)
-	}
-	if task.Spec == nil {
-		task.Spec = &v1alpha1.TaskSpec{}
-	}
-	task.Spec.Suspend = false
-	if err := s.store.SaveTask(ctx, task); err != nil {
-		return nil, status.Errorf(codes.Internal, "resuming task: %v", err)
+		return nil, taskError(err, atespace, req.Name)
 	}
 	return task, nil
 }
 
+// WatchTask streams a task's state as it changes. It asks the task for its
+// state on an interval and emits whatever is different, until the task is ready,
+// has finished, has failed, or is gone.
 func (s *Server) WatchTask(req *v1alpha1.WatchTaskRequest, stream grpc.ServerStreamingServer[v1alpha1.WatchTaskResponse]) error {
 	if req == nil {
 		return status.Error(codes.InvalidArgument, "missing request")
 	}
-	atespace := req.Atespace
-	if atespace == "" {
-		atespace = "default"
-	}
+	atespace := atespaceOf(req.Atespace)
 	ctx := stream.Context()
-	ch, closer, err := s.store.WatchTask(ctx, atespace, req.Name)
-	if err != nil {
-		return status.Errorf(codes.Internal, "watching task: %v", err)
-	}
-	defer closer.Close()
 
-	if initial, err := s.store.GetTask(ctx, atespace, req.Name); err == nil {
-		if err := stream.Send(&v1alpha1.WatchTaskResponse{Task: initial, Action: "INITIAL"}); err != nil {
-			return err
-		}
-	}
+	ticker := time.NewTicker(s.watchPollInterval)
+	defer ticker.Stop()
 
+	var last *v1alpha1.Task
+	action := "INITIAL"
 	for {
+		task, err := s.tasks.Get(ctx, atespace, req.Name)
+		switch {
+		case err == nil:
+		case errors.Is(err, orchestration.ErrTaskNotFound) && last != nil:
+			// The task was deleted while it was being watched.
+			return stream.Send(&v1alpha1.WatchTaskResponse{Task: last, Action: "DELETED"})
+		default:
+			return taskError(err, atespace, req.Name)
+		}
+
+		if last == nil || !proto.Equal(last, task) {
+			if err := stream.Send(&v1alpha1.WatchTaskResponse{Task: task, Action: action}); err != nil {
+				return err
+			}
+			action = "MODIFIED"
+			last = task
+		}
+		if watchDone(task) {
+			return nil
+		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case task, ok := <-ch:
-			if !ok {
-				return nil
-			}
-			if err := stream.Send(&v1alpha1.WatchTaskResponse{Task: task, Action: "MODIFIED"}); err != nil {
-				return err
-			}
-			if task.Status != nil && (task.Status.Phase == "Running" || task.Status.Phase == "Failed" || task.Status.Phase == "Completed") {
-				return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+// watchDone reports whether a task has reached a state worth stopping a watch
+// at: it can do work, or it never will.
+func watchDone(task *v1alpha1.Task) bool {
+	switch task.GetStatus().GetPhase() {
+	case v1alpha1.PhaseFailed, v1alpha1.PhaseCompleted:
+		return true
+	case v1alpha1.PhaseRunning:
+		for _, c := range task.GetStatus().GetConditions() {
+			if c.GetType() == v1alpha1.ConditionReady {
+				return c.GetStatus() == v1alpha1.ConditionTrue
 			}
 		}
 	}
+	return false
+}
+
+// resolveTask looks up the gateway and the workspaces a task binds. A binding
+// that does not exist is left out rather than rejected: a task may be applied
+// before its configuration is, and the runner treats a missing workspace as an
+// empty directory.
+func (s *Server) resolveTask(ctx context.Context, task *v1alpha1.Task) (*workflows.TaskDesiredState, error) {
+	atespace := task.GetMetadata().GetAtespace()
+	desired := &workflows.TaskDesiredState{Task: task}
+
+	if name := task.GetSpec().GetGateway().GetName(); name != "" {
+		gw, err := s.store.GetGateway(ctx, atespace, name)
+		switch {
+		case err == nil:
+			desired.Gateway = gw
+		case errors.Is(err, store.ErrNotFound):
+			slog.Warn("task binds a gateway that does not exist", "task", task.GetMetadata().GetName(), "gateway", name)
+		default:
+			return nil, status.Errorf(codes.Internal, "reading gateway %q: %v", name, err)
+		}
+	}
+
+	for _, ref := range task.GetSpec().WorkspaceRefs() {
+		if ref.GetName() == "" {
+			continue
+		}
+		ws, err := s.store.GetWorkspace(ctx, atespace, ref.GetName())
+		switch {
+		case err == nil:
+			desired.Workspaces = append(desired.Workspaces, ws)
+		case errors.Is(err, store.ErrNotFound):
+			slog.Warn("task binds a workspace that does not exist", "task", task.GetMetadata().GetName(), "workspace", ref.GetName())
+		default:
+			return nil, status.Errorf(codes.Internal, "reading workspace %q: %v", ref.GetName(), err)
+		}
+	}
+	return desired, nil
+}
+
+// taskError turns an orchestration error into the status code its caller
+// expects.
+func taskError(err error, atespace, name string) error {
+	switch {
+	case errors.Is(err, orchestration.ErrTaskNotFound):
+		return status.Errorf(codes.NotFound, "task %q not found in atespace %q", name, atespace)
+	case errors.Is(err, orchestration.ErrTaskTerminating):
+		return status.Errorf(codes.FailedPrecondition, "%v", err)
+	case errors.Is(err, orchestration.ErrInvalidTask):
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	default:
+		return status.Errorf(codes.Internal, "%v", err)
+	}
+}
+
+func atespaceOf(atespace string) string {
+	if atespace == "" {
+		return v1alpha1.DefaultAtespace
+	}
+	return atespace
 }
 
 // --- Gateways ---
