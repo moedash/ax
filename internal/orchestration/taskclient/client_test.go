@@ -278,6 +278,9 @@ func TestApplyAnswersPendingWhenNoWorkerAccepts(t *testing.T) {
 	if task.GetMetadata().GetName() != "job" {
 		t.Errorf("expected the task that was accepted, got %v", task.GetMetadata())
 	}
+	if task.GetMetadata().GetCreationTimestamp() != nil {
+		t.Error("the workflow owns the creation time and has not answered yet")
+	}
 	if fake.describes != 1 {
 		t.Errorf("expected the execution to be checked once, got %d", fake.describes)
 	}

@@ -632,3 +632,35 @@ func TestTaskTemplateNameCoversTheSpecFields(t *testing.T) {
 		t.Errorf("expected %q for the same spec, got %q", name, got)
 	}
 }
+
+// A retried poll continues the wait the first attempt started, rather than
+// giving the sandbox the whole budget again on every attempt.
+func TestAwaitWorkspaceReadyResumesItsDeadline(t *testing.T) {
+	control := substratetest.NewControlServer()
+	env, acts := newEnv(t, control)
+
+	// The first attempt's deadline has already passed, so a retry that honours
+	// it gives up at once instead of waiting another minute.
+	env.SetHeartbeatDetails(time.Now().Add(-time.Second))
+
+	start := time.Now()
+	value, err := env.ExecuteActivity(acts.AwaitWorkspaceReady, activities.WorkspaceReadyInput{
+		Actor:        activities.ActorRef{Atespace: "default", Name: "job"},
+		WorkerIP:     "127.0.0.1:1",
+		Timeout:      time.Minute,
+		PollInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("AwaitWorkspaceReady failed: %v", err)
+	}
+	var ready bool
+	if err := value.Get(&ready); err != nil {
+		t.Fatalf("decoding readiness: %v", err)
+	}
+	if ready {
+		t.Error("an unreachable sandbox is not ready")
+	}
+	if waited := time.Since(start); waited > 10*time.Second {
+		t.Errorf("expected the attempt to honour the original deadline, waited %s", waited)
+	}
+}
