@@ -54,6 +54,8 @@ metadata:
     app.kubernetes.io/name: ax-controller
     app.kubernetes.io/part-of: ax
 spec:
+  # Every replica polls the same task queue, and Temporal hands each piece of
+  # work to exactly one of them. Scale by raising this.
   replicas: 1
   selector:
     matchLabels:
@@ -69,13 +71,13 @@ spec:
           image: ko://github.com/google/ax/cmd/ax-controller
           imagePullPolicy: IfNotPresent
           args:
-            - "--redis-addr=ax-redis.ax-system.svc.cluster.local:6379"
+            - "--temporal-address=temporal-frontend.temporal.svc.cluster.local:7233"
+            - "--temporal-namespace=default"
+            - "--task-queue=ax-tasks"
             - "--substrate-endpoint=api.ate-system.svc.cluster.local:443"
             - "--substrate-authority=api.ate-system.svc"
             - "--substrate-token-file=/var/run/secrets/ateapi/token"
             - "--substrate-ca-file=/run/servicedns-ca/trust-bundle.pem"
-            - "--template=default-template"
-            - "--template-atespace=ax-system"
           env:
             - name: ATENET_ROUTER_ADDR
               value: "atenet-router.ate-system.svc.cluster.local:80"

@@ -18,11 +18,24 @@ make push-task-runner      # ...and push it (set TASK_RUNNER_REPO)
 
 ## Test
 
-Runs everything, including the mock Substrate gRPC server, in-memory store validation, and API server tests:
+Runs everything: the task workflow against a mocked Agent Substrate, the
+activities against an in-process fake of its Control API, a replay of a recorded
+task history, and the API server:
 
 ```bash
 make test        # or: go test -v ./...
 ```
+
+Determinism is checked separately, and is worth running after any change to
+`internal/orchestration/workflows`:
+
+```bash
+go install go.temporal.io/sdk/contrib/tools/workflowcheck@latest
+workflowcheck ./internal/orchestration/...
+```
+
+To run the control plane on your machine, see
+[Temporal orchestration](temporal.md#running-it-locally).
 
 ## Contributing
 

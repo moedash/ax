@@ -36,7 +36,12 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - "--addr=:8080"
+            # Redis holds the gateways, workspaces, and models a task binds.
             - "--redis-addr=ax-redis.ax-system.svc.cluster.local:6379"
+            # Tasks live in Temporal.
+            - "--temporal-address=temporal-frontend.temporal.svc.cluster.local:7233"
+            - "--temporal-namespace=default"
+            - "--task-queue=ax-tasks"
           ports:
             - containerPort: 8080
               name: http

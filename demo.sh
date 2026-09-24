@@ -146,7 +146,7 @@ printf '%s' "${DIM}"; sed 's/^/    /' "${DEMO_YAML}"; printf '%s\n\n' "${RESET}"
 run ax apply -f "${DEMO_YAML}"
 
 step "Watch the task come up"
-note "The controller creates an actor on Agent Substrate; the runner clones ${REPO_URL##*/} into /workspace."
+note "The task workflow creates an actor on Agent Substrate; the runner clones ${REPO_URL##*/} into /workspace."
 wait_for "Running" "True"
 ok "${TASK_NAME} is Running and Ready"
 echo

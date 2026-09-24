@@ -69,13 +69,14 @@ This puts the `ax` binary in `$(go env GOPATH)/bin`. Make sure that directory is
 
 ### 2. Deploy the control plane
 
-You need a Kubernetes cluster, [`ko`](https://ko.build/) (`brew install ko`), a container registry your cluster can pull from, and a reachable Agent Substrate Control API (in-cluster default: `api.ate-system.svc.cluster.local:443`).
+You need a Kubernetes cluster, [`ko`](https://ko.build/) (`brew install ko`), a container registry your cluster can pull from, a reachable Agent Substrate Control API (in-cluster default: `api.ate-system.svc.cluster.local:443`), and a Temporal service (in-cluster default: `temporal-frontend.temporal.svc.cluster.local:7233`).
 
 ```bash
+temporal operator search-attribute create --name AxAtespace --type Keyword
 make deploy AX_IMAGE_REPO=<your-registry>
 ```
 
-This deploys Redis, then builds and deploys the control plane images with `ko`. Everything lands in the `ax-system` namespace.
+The search attribute is a one-time setup per Temporal namespace; task listing uses it. `make deploy` then deploys Redis, which holds the gateways, workspaces, and models, and builds and deploys the control plane images with `ko`. Everything lands in the `ax-system` namespace.
 
 ### 3. Run your first task
 
@@ -103,6 +104,7 @@ Want to see the whole lifecycle end to end? Run [`./demo.sh`](demo.sh). It appli
 | [Runners](docs/runner.md) | Understand the contract between the control plane and the task container, and build your own runner image to replace the default. |
 | [Networking](docs/networking.md) | Reach a running task through the atenet router from the cluster, your laptop, or a gRPC client. |
 | [Architecture](DESIGN.md) | Understand how the control plane fits together, plus the [API reference](DESIGN.md#api-reference). |
+| [Temporal orchestration](docs/temporal.md) | Follow a task through its workflow: the updates, the queries, every timeout, and how to run the whole thing on a laptop. |
 | [Development](docs/development.md) | Build, test, and ship changes to AX itself. |
 
 ## CLI usage

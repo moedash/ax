@@ -81,7 +81,7 @@ make push-task-runner TASK_RUNNER_REPO=gcr.io/<your-project>/ax-task-runner
 
 ### Deploying to Kubernetes
 
-Deploy Redis, controller, and server components to your cluster in the `ax-system` namespace:
+Deploy Redis, the Temporal worker, and the API server to your cluster in the `ax-system` namespace:
 
 ```bash
 make deploy AX_IMAGE_REPO=gcr.io/<your-project>/ax-images

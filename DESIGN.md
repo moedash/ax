@@ -2,7 +2,7 @@
 
 ## Architecture
 
-Storing millions of short-lived tasks as Kubernetes CRDs pushes etcd past its comfort zone (single-digit GB storage limits, write-rate bottlenecks, control plane degradation). AX keeps its state in Redis and uses Redis Streams as the work queue between the API server and a horizontally scaled pool of controllers.
+Storing millions of short-lived tasks as Kubernetes CRDs pushes etcd past its comfort zone (single-digit GB storage limits, write-rate bottlenecks, control plane degradation). AX keeps each task in a Temporal workflow instead. The workflow is the task: it owns the task's desired state and its status, it drives Agent Substrate, and it survives a worker that dies mid-provisioning. The configuration kinds a task binds stay in Redis, where a plain key-value store is the right shape.
 
 ```
                       ax apply -f task.yaml
@@ -11,22 +11,25 @@ Storing millions of short-lived tasks as Kubernetes CRDs pushes etcd past its co
                             ax-server
                       (gRPC API + /healthz)
                                 │
-                     store & publish event
-                                │
-                                ▼
-                              Redis
-               (Task Hashes + Event Streams + PubSub)
-                                │
-                      XREADGROUP (Streams)
-                                │
-                                ▼
-                          ax-controller
-                   (Horizontally Scaled Workers)
-                                │
-                        gRPC (Control API)
-                                │
-                                ▼
-                         Agent Substrate
+                ┌───────────────┴───────────────┐
+                │                               │
+        update / query                     get / save
+        the task workflow               gateways, workspaces,
+                │                             models
+                ▼                               ▼
+            Temporal                          Redis
+      (one workflow per task)
+                │
+        task queue: ax-tasks
+                │
+                ▼
+          ax-controller
+     (Temporal workers, scale out)
+                │
+        gRPC (Control API)
+                │
+                ▼
+         Agent Substrate
                 ┌───────────────────────────────┐
                 │ • Atespace Provisioning       │
                 │ • Actor Creation & Activation │
@@ -35,13 +38,15 @@ Storing millions of short-lived tasks as Kubernetes CRDs pushes etcd past its co
                 └───────────────────────────────┘
 ```
 
+A task's workflow ID is its business key, `<atespace>/<name>`, so the API server addresses a task without keeping a mapping and two callers cannot create the same task twice. Creating or changing a task is an update, reading one is a query, and listing them goes through Temporal visibility on the `AxAtespace` search attribute. See [Temporal orchestration](docs/temporal.md) for the whole mapping, the timeouts, and how to run it locally.
+
 ## Components
 
 | Binary | Role |
 |---|---|
 | `ax` | Developer CLI. Applies manifests, inspects and watches resources, tunnels to the cluster. |
-| `ax-server` | Stateless gRPC API on port 8080. Validates manifests, persists to Redis, publishes events. |
-| `ax-controller` | Reconciliation workers. Consume the Redis stream, provision atespaces and actors on Agent Substrate, apply egress policy, and drive tasks toward desired state. Scale by adding replicas. |
+| `ax-server` | Stateless gRPC API on port 8080. Validates manifests, resolves what a task binds, and routes task calls to Temporal. The configuration kinds go to Redis. |
+| `ax-controller` | Temporal workers. Run the task workflows and their activities: provision atespaces and actors on Agent Substrate, apply egress policy, and keep each task in the state its spec asks for. Scale by adding replicas. |
 | `ax-task-runner` | Entrypoint inside every task container. Bootstraps the workspace, serves metadata, and runs the agent command. A thin wrapper over the `runner` package, which custom images can embed directly. |
 
 ## API reference
@@ -55,10 +60,10 @@ The control plane exposes the `ax.v1alpha1.AX` gRPC service. Health checks are p
 | `GetTask` | Get a task by atespace and name. |
 | `ListTasks` | List tasks in an atespace, with pagination. |
 | `UpdateTask` | Create or update a task. |
-| `DeleteTask` | Delete a task. |
+| `DeleteTask` | Delete a task. The task reports `Terminating` while its sandbox is torn down, then disappears. |
 | `SuspendTask` | Checkpoint actor state and pause the task. |
 | `ResumeTask` | Resume a suspended task. |
-| `WatchTask` | Server-streaming RPC that emits status and condition transitions as they happen. |
+| `WatchTask` | Server-streaming RPC that emits status and condition transitions until the task is ready, has finished, or has failed. |
 
 **Gateways**
 

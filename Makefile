@@ -27,7 +27,7 @@ all: build
 ## Build Targets
 ## --------------------------------------
 
-# Build all local binaries (ax CLI, controller, server)
+# Build all local binaries (ax CLI, Temporal worker, API server)
 build: build-binaries
 
 build-binaries:
@@ -72,7 +72,7 @@ deploy-redis:
 	kubectl apply -f deploy/redis.yaml
 
 deploy-controller:
-	@echo "==> Building and deploying ax-controller using ko..."
+	@echo "==> Building and deploying the ax-controller worker using ko..."
 	KO_DOCKER_REPO=$(AX_IMAGE_REPO) ko apply -f deploy/ax-controller.yaml
 
 deploy-server:

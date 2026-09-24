@@ -17,6 +17,9 @@ kind: Namespace
 metadata:
   name: ax-system
 ---
+# Redis holds the AX configuration kinds: the gateways, workspaces, and models
+# that tasks bind. Task state lives in Temporal, so nothing here is on the path
+# of a running task.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

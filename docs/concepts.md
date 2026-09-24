@@ -10,7 +10,7 @@ The unit is deliberately small. An agent is not one process that runs to complet
 
 ### Lifecycle
 
-`status.phase` is a one-word summary of where the task is: `Running`, `Suspended`, `Failed`, `Terminating`, and so on. Conditions carry the detail. Watch them with `ax watch` or poll them with `ax describe`.
+`status.phase` is a one-word summary of where the task is: `Pending`, `Running`, `Suspended`, `Completed`, `Failed`, or `Terminating`. It is derived from the state of the sandbox, so a task moves back and forth between them over its life. Conditions carry the detail. Watch them with `ax watch` or poll them with `ax describe`.
 
 | Condition | True when |
 |---|---|
@@ -18,7 +18,7 @@ The unit is deliberately small. An agent is not one process that runs to complet
 | `GatewayReady` | The gateway's network policies were applied to the sandbox. |
 | `Ready` | The task is running and `WorkspaceReady` is True. This is the one to wait on. |
 
-Two transitions are worth knowing. Suspending a task sets `Ready` to False with reason `TaskSuspended`; resuming sets it back. Deleting a task moves it to `Terminating` while the controller tears down the sandbox, then removes the record entirely. `ax delete` blocks until that has happened.
+Three transitions are worth knowing. Suspending a task sets `Ready` to False with reason `TaskSuspended`; resuming sets it back. When the task's command exits, the task becomes `Completed` and `status.exitCode` carries the command's exit status, while the sandbox stays up so you can still look inside it. Deleting a task moves it to `Terminating` while its sandbox is torn down, then removes the record entirely. `ax delete` blocks until that has happened.
 
 ## Workspace
 

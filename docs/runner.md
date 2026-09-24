@@ -1,6 +1,6 @@
 # Runners
 
-A runner is the program that AX starts as PID 1 inside every task container. It is the bridge between the control plane and whatever your agent actually is: the controller hands it the `Task` and `Workspace` specs, and the runner turns them into a prepared workspace, a running command, and a small HTTP surface that the rest of AX uses to observe the sandbox.
+A runner is the program that AX starts as PID 1 inside every task container. It is the bridge between the control plane and whatever your agent actually is: the control plane hands it the `Task` and `Workspace` specs, and the runner turns them into a prepared workspace, a running command, and a small HTTP surface that the rest of AX uses to observe the sandbox.
 
 AX ships a default runner, `ax-task-runner`, baked into the default task image. You do not have to use it. Any binary that honors the contract below can be packaged into a container image and named in `spec.image`, and the control plane will treat it exactly like the default.
 
@@ -8,14 +8,16 @@ This page describes what a runner must do. For what the default runner exposes t
 
 ## How a runner is launched
 
-The controller does not run `spec.command` as the container entrypoint. It always starts the container with a fixed command and lets the runner take it from there:
+AX does not run `spec.command` as the container entrypoint. It always starts the container with a fixed command and lets the runner take it from there:
 
-| What the controller sets | Value |
+| What AX sets | Value |
 |---|---|
 | Container image | `spec.image`, or the default `ax-task-runner` image when unset |
 | Container command | `/usr/local/bin/ax-task-runner`, always |
-| `AX_TASK_YAML` | The full `Task` resource as YAML, including status |
+| `AX_TASK_YAML` | The `Task` resource as YAML, without its status |
 | `AX_WORKSPACES_YAML` | Every bound `Workspace` resource as a multi-document YAML stream, in the task's binding order |
+| `AX_WORKFLOW_ID` | The task's workflow, which is where the runner reports how the task command finished |
+| `AX_TEMPORAL_ADDRESS`, `AX_TEMPORAL_NAMESPACE` | Where that report goes |
 | `spec.env` entries | Each one set directly in the container environment |
 | `GEMINI_API_KEY` | Set when the atespace has a Gemini credential configured |
 | Volume | A durable directory mounted at `/workspace` |
@@ -27,12 +29,12 @@ The `/workspace` volume is what survives suspend and resume. Agent Substrate sna
 
 ## What a runner must do
 
-**Serve HTTP on port 80.** Both Agent Substrate and the AX controller probe the container on this port. The paths that matter:
+**Serve HTTP on port 80.** Both Agent Substrate and AX probe the container on this port. The paths that matter:
 
 | Path | Behavior |
 |---|---|
 | `/healthz` | Return `200` as soon as the runner is alive. |
-| `/readyz` | Return `503` until the workspace is prepared, then `200`. The controller polls this to set the task's `WorkspaceReady` condition, and `ax watch` shows the transition. |
+| `/readyz` | Return `503` until the workspace is prepared, then `200`. The task's workflow polls this to set its `WorkspaceReady` condition, and `ax watch` shows the transition. |
 | `/metadata/v1alpha1/ax/task` | Return the `Task` as `application/yaml`. Optional, but your command and `ax` tooling may expect it. |
 | `/metadata/v1alpha1/ax/workspaces` | Return every bound `Workspace` as a multi-document YAML stream. Optional, as above. |
 
@@ -40,7 +42,9 @@ The `/workspace` volume is what survives suspend and resume. Agent Substrate sna
 
 **Run the command and supervise it.** Start `spec.command` as a child process with the first workspace as its working directory. Give it `AX_METADATA_URL` pointing at your own HTTP server plus every `spec.env` entry. Put it in its own process group so you can signal everything it spawns.
 
-**Stay up after the command exits.** The runner is PID 1, and the container lives as long as it does. If the runner exits when the command does, the metadata server goes with it and `ax ssh` stops working. Log the exit status and keep serving until you are told to stop. The control plane does not currently read the command's exit status back from the container.
+**Stay up after the command exits.** The runner is PID 1, and the container lives as long as it does. If the runner exits when the command does, the metadata server goes with it and `ax ssh` stops working. Keep serving until you are told to stop.
+
+**Report the exit status.** When the command finishes, send the `complete` update to the workflow named by `AX_WORKFLOW_ID` at `AX_TEMPORAL_ADDRESS`, carrying the exit code. That is what moves the task to `Completed` and fills in `status.exitCode`. Keep it best effort: the sandbox has to stay up and inspectable whether or not the control plane can be reached. The default runner tries the update, falls back to a signal of the same name, and gives up after ten seconds.
 
 **Shut down cleanly on `SIGTERM`.** Stop and suspend both deliver `SIGTERM` to PID 1. Forward it to the command's process group, wait a bounded grace period, then `SIGKILL` whatever is left. Flush anything the agent needs to survive a resume before you exit.
 
@@ -148,7 +152,7 @@ spec:
   debug: true
 ```
 
-The controller provisions a dedicated Agent Substrate actor template for each distinct image and environment, so different tasks can run different runners side by side in the same atespace.
+AX provisions a dedicated Agent Substrate actor template for each distinct image and environment, so different tasks can run different runners side by side in the same atespace.
 
 ## Testing a runner locally
 
