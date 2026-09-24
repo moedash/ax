@@ -36,9 +36,46 @@ const (
 
 	DefaultTaskImage = "gcr.io/ax-substrate/ate-images/ax-task-runner"
 
+	// DefaultAtespace holds resources whose manifest leaves the atespace empty.
+	DefaultAtespace = "default"
+)
+
+// Task phases reported on status.phase. A task's phase is derived from the state
+// of its sandbox, so the same task can move back and forth between them.
+const (
+	// PhasePending marks a task whose sandbox is still being provisioned.
+	PhasePending = "Pending"
+	// PhaseRunning marks a task whose actor is running on a worker.
+	PhaseRunning = "Running"
+	// PhaseSuspended marks a task whose actor has been checkpointed and stopped.
+	PhaseSuspended = "Suspended"
+	// PhaseCompleted marks a task whose command has exited. The sandbox stays up
+	// and inspectable, and status.exitCode carries the command's exit status.
+	PhaseCompleted = "Completed"
+	// PhaseFailed marks a task whose sandbox could not be provisioned.
+	PhaseFailed = "Failed"
 	// PhaseTerminating marks a task whose deletion has been requested and whose
 	// actor is being torn down. The record disappears once cleanup completes.
 	PhaseTerminating = "Terminating"
+)
+
+// Condition types reported on status.conditions.
+const (
+	// ConditionReady reports whether the task as a whole is ready to do work: its
+	// actor is running and the workspace inside it has finished setting up.
+	ConditionReady = "Ready"
+	// ConditionWorkspaceReady reports whether the workspace inside the actor has
+	// finished setting up.
+	ConditionWorkspaceReady = "WorkspaceReady"
+	// ConditionGatewayReady reports whether the gateway's network policies were
+	// applied to the actor.
+	ConditionGatewayReady = "GatewayReady"
+)
+
+// Condition status values.
+const (
+	ConditionTrue  = "True"
+	ConditionFalse = "False"
 )
 
 // YAML encoding.
