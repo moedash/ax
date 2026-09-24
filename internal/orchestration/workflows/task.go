@@ -283,8 +283,9 @@ func (r *taskRun) provision(ctx workflow.Context) error {
 	saga.add("actor", func(ctx workflow.Context) error {
 		return workflow.ExecuteActivity(ctx, acts.DeleteActorIfExists, actor).Get(ctx, nil)
 	})
-	if err := workflow.ExecuteActivity(provisionCtx, acts.EnsureActor,
-		activities.ActorInput{Actor: actor, Template: resolved}).Get(provisionCtx, nil); err != nil {
+	actorCtx := workflow.WithActivityOptions(ctx, activities.ActorOptions())
+	if err := workflow.ExecuteActivity(actorCtx, acts.EnsureActor,
+		activities.ActorInput{Actor: actor, Template: resolved}).Get(actorCtx, nil); err != nil {
 		saga.run(ctx)
 		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "ActorCreationFailed", err.Error())
 		return err
@@ -332,7 +333,7 @@ func (r *taskRun) activate(ctx workflow.Context) error {
 		if r.sandbox == sandboxSuspended {
 			return nil
 		}
-		suspendCtx := workflow.WithActivityOptions(ctx, activities.ProvisionOptions())
+		suspendCtx := workflow.WithActivityOptions(ctx, activities.ActorOptions())
 		if err := workflow.ExecuteActivity(suspendCtx, acts.SuspendActor, actor).Get(suspendCtx, nil); err != nil {
 			r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "ActorSuspendFailed", err.Error())
 			return err

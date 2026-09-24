@@ -67,9 +67,21 @@ func retryPolicy() *temporal.RetryPolicy {
 	}
 }
 
-// ProvisionOptions configures the short control-plane calls that provision a
-// task: the atespace, the actor template, the actor, and its egress policy.
+// ProvisionOptions configures the control-plane calls that return as soon as
+// Substrate has accepted them: the atespace, the actor template, the egress
+// policy, and reading an actor's state. They do not heartbeat, so they carry no
+// heartbeat timeout.
 func ProvisionOptions() workflow.ActivityOptions {
+	return workflow.ActivityOptions{
+		StartToCloseTimeout:    controlCallTimeout,
+		ScheduleToCloseTimeout: provisionBudget,
+		RetryPolicy:            retryPolicy(),
+	}
+}
+
+// ActorOptions configures the calls that block while Substrate settles an
+// actor, which is why they report liveness.
+func ActorOptions() workflow.ActivityOptions {
 	return workflow.ActivityOptions{
 		StartToCloseTimeout:    controlCallTimeout,
 		ScheduleToCloseTimeout: provisionBudget,

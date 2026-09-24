@@ -286,6 +286,10 @@ func (a *Activities) DeleteEgressPolicyIfExists(ctx context.Context, in ActorRef
 		return invalidSpec("actor name is required")
 	}
 	activity.GetLogger(ctx).Info("deleting egress policy", "actor", in.Name)
+
+	stop := heartbeatUntilDone(ctx)
+	defer stop()
+
 	return classify(a.Substrate.DeleteEgressPolicy(ctx, in.Atespace, in.Name))
 }
 
@@ -297,6 +301,9 @@ func (a *Activities) DeleteActorTemplates(ctx context.Context, in TemplatesInput
 		return invalidSpec("task name is required")
 	}
 	logger := activity.GetLogger(ctx)
+
+	stop := heartbeatUntilDone(ctx)
+	defer stop()
 
 	templates, err := a.Substrate.ListActorTemplates(ctx, in.Atespace)
 	if err != nil {
