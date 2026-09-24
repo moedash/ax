@@ -36,6 +36,9 @@ var (
 	ErrTaskTerminating = errors.New("task is being deleted")
 	// ErrInvalidTask reports a task spec the control plane refused.
 	ErrInvalidTask = errors.New("invalid task")
+	// ErrTaskUnavailable reports a task whose worker did not answer in time.
+	// The task exists; nothing is running to speak for it right now.
+	ErrTaskUnavailable = errors.New("task is unavailable")
 )
 
 // Tasks reaches the workflow that owns each task. Tasks are addressed by their

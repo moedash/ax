@@ -90,7 +90,13 @@ func (r *taskRun) queryStatus() (*v1alpha1.TaskStatus, error) {
 // stands once the change has been driven into Substrate. Creating a task is the
 // same operation, sent together with the workflow start.
 func (r *taskRun) handleApply(ctx workflow.Context, desired *TaskDesiredState) (*v1alpha1.Task, error) {
+	created := r.desired.Task.GetMetadata().GetCreationTimestamp()
 	r.desired = normalizeDesired(desired)
+	if created != nil {
+		// A task is created once. Whatever a later apply carries, the creation
+		// time is the one the task started with.
+		r.desired.Task.Metadata.CreationTimestamp = created
+	}
 	if err := r.awaitHandled(ctx, r.request()); err != nil {
 		return nil, err
 	}

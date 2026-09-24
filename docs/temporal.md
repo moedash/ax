@@ -133,6 +133,24 @@ returns:
   the worker's bearer token is a projected service account token that is rotated
   in place, so a rejected call usually succeeds on the next attempt.
 
+## What a caller waits for
+
+A change to a task is durable as soon as Temporal has it, but it is only
+*applied* by a worker, and placing an actor on a worker can take minutes. So
+every call the API server makes has a bounded wait:
+
+| Call | Waits for | If nothing answers in time |
+|---|---|---|
+| `UpdateTask` | The `apply` update to complete, up to 10 seconds | The task was created; it is reported `Pending` |
+| `SuspendTask`, `ResumeTask`, `DeleteTask` | The update to be accepted, up to 10 seconds | `Unavailable`, with the task named |
+| `GetTask` | The `task` query, up to 5 seconds | `Unavailable` |
+| `ListTasks` | Visibility, then one query per task, up to 5 seconds each | The task is listed with what visibility knows and no status |
+
+This is the one place where the new design is less forgiving than the old one.
+Writing a task to Redis succeeded whether or not a controller was alive to act
+on it, and the task then sat there untouched. Now a control plane with no
+workers says so.
+
 ## Idempotency
 
 Every activity is idempotent, and the keys they act on are derived in the
@@ -254,3 +272,6 @@ whole history, and its pending updates.
   'TaskWorkflow'"` lists them, `temporal workflow show -w <atespace>/<name>`
   shows everything that has happened to one, and a task stuck in `Pending` shows
   exactly which activity is failing and why.
+- **With no worker running, task calls report `Unavailable`.** Reading or
+  changing a task needs a worker to answer for it. A listing still works, and
+  shows the tasks that exist with no status.

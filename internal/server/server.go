@@ -138,13 +138,9 @@ func (s *Server) UpdateTask(ctx context.Context, req *v1alpha1.UpdateTaskRequest
 	if err := v1alpha1.ValidateTask(task); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	task.Metadata = defaultMetadata(task.Metadata, func(atespace, name string) *v1alpha1.ObjectMeta {
-		existing, err := s.tasks.Get(ctx, atespace, name)
-		if err != nil {
-			return nil
-		}
-		return existing.GetMetadata()
-	})
+	// A task that already exists keeps the creation time its workflow recorded,
+	// so nothing here has to read the task back first.
+	task.Metadata = defaultMetadata(task.Metadata, func(string, string) *v1alpha1.ObjectMeta { return nil })
 
 	desired, err := s.resolveTask(ctx, task)
 	if err != nil {
@@ -303,6 +299,8 @@ func taskError(err error, atespace, name string) error {
 		return status.Errorf(codes.FailedPrecondition, "%v", err)
 	case errors.Is(err, orchestration.ErrInvalidTask):
 		return status.Errorf(codes.InvalidArgument, "%v", err)
+	case errors.Is(err, orchestration.ErrTaskUnavailable):
+		return status.Errorf(codes.Unavailable, "%v", err)
 	default:
 		return status.Errorf(codes.Internal, "%v", err)
 	}
