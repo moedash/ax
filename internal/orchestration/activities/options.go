@@ -104,11 +104,17 @@ func ResumeOptions() workflow.ActivityOptions {
 // WorkspaceReadyOptions configures the readiness poll. StartToClose leaves room
 // beyond the poll's own budget so that the activity reports not-ready itself
 // instead of being timed out and restarted.
+//
+// Attempts are capped because the poll already tolerates a sandbox that is slow
+// to come up: it reports not-ready rather than failing. An error from it means
+// the probe cannot run at all, which more attempts will not fix.
 func WorkspaceReadyOptions(pollTimeout time.Duration) workflow.ActivityOptions {
+	policy := retryPolicy()
+	policy.MaximumAttempts = 3
 	return workflow.ActivityOptions{
 		StartToCloseTimeout: pollTimeout + controlCallTimeout,
 		HeartbeatTimeout:    heartbeatTimeout,
-		RetryPolicy:         retryPolicy(),
+		RetryPolicy:         policy,
 	}
 }
 

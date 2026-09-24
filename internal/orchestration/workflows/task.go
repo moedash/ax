@@ -324,9 +324,8 @@ func (r *taskRun) provision(ctx workflow.Context) error {
 	return nil
 }
 
-// activate brings the sandbox into the state the spec asks for and waits for
-// the workspace inside it, so that a task reports Ready only once it can
-// actually do work.
+// activate brings the sandbox into the state the spec asks for: suspended and
+// checkpointed, or running on a worker.
 //
 // Activation is retried but never compensated. Deleting a sandbox because a
 // resume failed would throw away the workspace the task has been building, so a
@@ -407,7 +406,8 @@ func (r *taskRun) settleWorkspace(ctx workflow.Context) {
 		switch {
 		case err != nil:
 			// A probe that cannot run leaves the task running and not ready. The
-			// next activation of the sandbox tries again.
+			// resync looks again, so nothing has to be retried here.
+			r.workspaceProbed = true
 			workflow.GetLogger(gctx).Error("workspace probe failed", "task", r.key(), "error", err)
 			r.setCondition(gctx, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionFalse, "ProbeFailed", err.Error())
 		case ready:
@@ -454,6 +454,12 @@ func (r *taskRun) resync(ctx workflow.Context) {
 		r.status.WorkerIp = observed.WorkerIP
 		r.sandbox = sandboxRunning
 	default:
+		// The sandbox is what the task says it should be. A workspace that was
+		// still initializing gets another look, so a maiden run that outlasts the
+		// poll still reports ready in the end.
+		if r.status.GetWorkerIp() != "" && !r.conditionTrue(v1alpha1.ConditionWorkspaceReady) {
+			r.workspaceProbed = false
+		}
 		r.syncPhase()
 		return
 	}

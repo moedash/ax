@@ -605,3 +605,41 @@ func assertCondition(t *testing.T, status *v1alpha1.TaskStatus, condType, wantSt
 	}
 	t.Errorf("expected a %s condition, got %v", condType, status.GetConditions())
 }
+
+// A maiden run that outlasts the readiness poll still reports ready: the resync
+// looks again.
+func (s *taskWorkflowSuite) TestResyncRechecksAWorkspaceThatWasStillInitializing() {
+	s.calls.workspaceReady = false
+	s.calls.observation = activities.ActorObservation{
+		Exists:   true,
+		State:    activities.ActorStateRunning,
+		WorkerIP: "10.244.1.42",
+	}
+
+	var initializing, ready *v1alpha1.TaskStatus
+	s.env.RegisterDelayedCallback(func() {
+		initializing = s.queryStatus()
+		// The workspace finishes setting up while the task is running.
+		s.calls.mu.Lock()
+		s.calls.workspaceReady = true
+		s.calls.mu.Unlock()
+	}, time.Second)
+	s.env.RegisterDelayedCallback(func() {
+		ready = s.queryStatus()
+	}, 6*time.Minute)
+	s.delete(6*time.Minute + time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflow, testInput())
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.Require().NotNil(initializing)
+	assertCondition(s.T(), initializing, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionFalse, "Initializing")
+	assertCondition(s.T(), initializing, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "WorkspaceInitializing")
+
+	s.Len(s.calls.get(&s.calls.probes), 2, "the resync probes the workspace again")
+	s.Require().NotNil(ready)
+	assertCondition(s.T(), ready, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue, "SetupComplete")
+	assertCondition(s.T(), ready, v1alpha1.ConditionReady, v1alpha1.ConditionTrue, "TaskRunning")
+	// The sandbox itself was never rebuilt.
+	s.Len(s.calls.get(&s.calls.actors), 1)
+}
