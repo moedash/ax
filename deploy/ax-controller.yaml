@@ -66,6 +66,9 @@ spec:
         app.kubernetes.io/name: ax-controller
     spec:
       serviceAccountName: ax-controller
+      # Long enough for the worker's own stop timeout, so a shutdown does not
+      # abandon a control call halfway.
+      terminationGracePeriodSeconds: 390
       containers:
         - name: controller
           image: ko://github.com/google/ax/cmd/ax-controller

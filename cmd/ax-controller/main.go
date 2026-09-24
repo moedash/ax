@@ -44,6 +44,12 @@ const (
 	// waiting: on a Substrate control call, on an actor being placed, or on a
 	// workspace being set up inside a sandbox.
 	maxConcurrentActivities = 200
+
+	// workerStopTimeout outlasts the longest control-plane call, placing an
+	// actor on a worker, so a shutdown does not abandon one halfway. The
+	// readiness poll can run longer than this and is cut short on purpose: it
+	// is idempotent and another worker picks it up.
+	workerStopTimeout = 6 * time.Minute
 )
 
 func main() {
@@ -135,6 +141,7 @@ func main() {
 
 	w := worker.New(temporalClient, taskQueue, worker.Options{
 		MaxConcurrentActivityExecutionSize: maxConcurrentActivities,
+		WorkerStopTimeout:                  workerStopTimeout,
 	})
 	// Registered under the workflow type rather than the function, so workers
 	// with different settings still answer for the same tasks.
