@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -634,22 +635,49 @@ func TestTaskTemplateNameCoversTheSpecFields(t *testing.T) {
 }
 
 // A retried poll continues the wait the first attempt started, rather than
-// giving the sandbox the whole budget again on every attempt.
+// giving the sandbox the whole budget again on every attempt. What says so is
+// how many times the sandbox is asked, not how long the attempt took.
 func TestAwaitWorkspaceReadyResumesItsDeadline(t *testing.T) {
-	control := substratetest.NewControlServer()
-	env, acts := newEnv(t, control)
+	var probes atomic.Int32
+	sandbox := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probes.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer sandbox.Close()
 
-	// The first attempt's deadline has already passed, so a retry that honours
-	// it gives up at once instead of waiting another minute.
-	env.SetHeartbeatDetails(time.Now().Add(-time.Second))
-
-	start := time.Now()
-	value, err := env.ExecuteActivity(acts.AwaitWorkspaceReady, activities.WorkspaceReadyInput{
+	in := activities.WorkspaceReadyInput{
 		Actor:        activities.ActorRef{Atespace: "default", Name: "job"},
-		WorkerIP:     "127.0.0.1:1",
-		Timeout:      time.Minute,
+		WorkerIP:     strings.TrimPrefix(sandbox.URL, "http://"),
+		Timeout:      2 * time.Second,
 		PollInterval: 10 * time.Millisecond,
-	})
+	}
+
+	// An attempt that picks up a deadline which has already passed asks once
+	// and gives up.
+	env, acts := newEnv(t, substratetest.NewControlServer())
+	env.SetHeartbeatDetails(time.Now().Add(-time.Second))
+	if ready := runWorkspaceProbe(t, env, acts, in); ready {
+		t.Error("an unready sandbox is not ready")
+	}
+	if got := probes.Load(); got != 1 {
+		t.Errorf("expected the attempt to stop at the deadline it was given, asked %d times", got)
+	}
+
+	// A first attempt, with no deadline to carry, waits out its own budget.
+	// Without that difference the assertion above would say nothing.
+	probes.Store(0)
+	fresh, freshActs := newEnv(t, substratetest.NewControlServer())
+	if ready := runWorkspaceProbe(t, fresh, freshActs, in); ready {
+		t.Error("an unready sandbox is not ready")
+	}
+	if got := probes.Load(); got < 2 {
+		t.Errorf("expected a first attempt to keep asking, asked %d times", got)
+	}
+}
+
+func runWorkspaceProbe(t *testing.T, env *testsuite.TestActivityEnvironment, acts *activities.Activities, in activities.WorkspaceReadyInput) bool {
+	t.Helper()
+	value, err := env.ExecuteActivity(acts.AwaitWorkspaceReady, in)
 	if err != nil {
 		t.Fatalf("AwaitWorkspaceReady failed: %v", err)
 	}
@@ -657,10 +685,5 @@ func TestAwaitWorkspaceReadyResumesItsDeadline(t *testing.T) {
 	if err := value.Get(&ready); err != nil {
 		t.Fatalf("decoding readiness: %v", err)
 	}
-	if ready {
-		t.Error("an unreachable sandbox is not ready")
-	}
-	if waited := time.Since(start); waited > 10*time.Second {
-		t.Errorf("expected the attempt to honour the original deadline, waited %s", waited)
-	}
+	return ready
 }
