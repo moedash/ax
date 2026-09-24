@@ -65,7 +65,8 @@ func main() {
 	flag.StringVar(&temporalAddress, "temporal-address", defaultTemporalAddress, "Temporal frontend address")
 	flag.StringVar(&temporalNamespace, "temporal-namespace", defaultTemporalNamespace, "Temporal namespace")
 	flag.StringVar(&taskQueue, "task-queue", defaultTaskQueue, "Task queue this worker polls")
-	flag.DurationVar(&resyncInterval, "resync-interval", 0, "How often a settled task checks its sandbox against Substrate (0 uses the built-in default). Each interval costs one read per task.")
+	flag.DurationVar(&resyncInterval, "resync-interval", workflows.DefaultConfig().ResyncInterval,
+		"How often a settled task checks its sandbox against Substrate. Each interval costs one read per task.")
 	flag.BoolVar(&reportCompletion, "sandbox-report-completion", false, "Let task containers report their command's exit to their own workflow. This gives anything in a sandbox a route to the Temporal frontend, so it is only as safe as the frontend's authentication.")
 	flag.StringVar(&sandboxAddress, "sandbox-temporal-address", "", "Temporal address task containers dial to report their command's exit (defaults to --temporal-address)")
 	flag.StringVar(&substrateEndpoint, "substrate-endpoint", "api.ate-system.svc.cluster.local:443", "Agent Substrate Control API endpoint")
