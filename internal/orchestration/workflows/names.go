@@ -61,9 +61,6 @@ const (
 
 // Error types the workflow returns to its callers.
 const (
-	// ErrTypeTaskDeleted is returned by queries once the task's sandbox has been
-	// torn down. The API server turns it into a NotFound.
-	ErrTypeTaskDeleted = "TaskDeleted"
 	// ErrTypeTaskTerminating rejects updates to a task that is going away.
 	ErrTypeTaskTerminating = "TaskTerminating"
 	// ErrTypeInvalidTask rejects an update whose task spec cannot be applied.

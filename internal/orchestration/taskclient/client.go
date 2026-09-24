@@ -69,10 +69,11 @@ func (c *Client) Apply(ctx context.Context, desired *workflows.TaskDesiredState)
 		return nil, fmt.Errorf("%w: task name is required", orchestration.ErrInvalidTask)
 	}
 	atespace := atespaceOf(desired.Task.GetMetadata().GetAtespace())
-	desired.Task.GetMetadata().Atespace = atespace
+	name := desired.Task.GetMetadata().GetName()
+	workflowID := workflows.TaskWorkflowID(atespace, name)
 
 	start := c.client.NewWithStartWorkflowOperation(sdkclient.StartWorkflowOptions{
-		ID:        workflows.TaskWorkflowID(atespace, desired.Task.GetMetadata().GetName()),
+		ID:        workflowID,
 		TaskQueue: c.taskQueue,
 		// A task that is still running takes the update. A task whose workflow has
 		// ended, because it was deleted, is created again under the same name.
@@ -97,7 +98,7 @@ func (c *Client) Apply(ctx context.Context, desired *workflows.TaskDesiredState)
 	})
 	if err != nil {
 		if timedOut(ctx, waitCtx) {
-			return acceptedTask(desired.Task), nil
+			return c.acceptedTask(ctx, workflowID, desired.Task)
 		}
 		return nil, mapError(err)
 	}
@@ -105,24 +106,32 @@ func (c *Client) Apply(ctx context.Context, desired *workflows.TaskDesiredState)
 	var task v1alpha1.Task
 	if err := handle.Get(waitCtx, &task); err != nil {
 		if timedOut(ctx, waitCtx) {
-			return acceptedTask(desired.Task), nil
+			return c.acceptedTask(ctx, workflowID, desired.Task)
 		}
 		return nil, mapError(err)
 	}
 	return &task, nil
 }
 
-// acceptedTask is what a caller is told about a task that has been created but
-// whose workflow has not reported back yet.
-func acceptedTask(task *v1alpha1.Task) *v1alpha1.Task {
+// acceptedTask answers for a task whose workflow has not reported back inside
+// the wait. The start and the update travel in one request, so an expired wait
+// says nothing about whether the task was created: the execution is asked for
+// directly, and the task is reported Pending only if it is really there.
+func (c *Client) acceptedTask(ctx context.Context, workflowID string, task *v1alpha1.Task) (*v1alpha1.Task, error) {
+	describeCtx, cancel := context.WithTimeout(ctx, queryWait)
+	defer cancel()
+
+	if _, err := c.client.DescribeWorkflowExecution(describeCtx, workflowID, ""); err != nil {
+		return nil, fmt.Errorf("%w: task %s was not accepted: %s", orchestration.ErrTaskUnavailable, workflowID, err)
+	}
 	out, ok := proto.Clone(task).(*v1alpha1.Task)
 	if !ok {
-		return task
+		return task, nil
 	}
 	out.ApiVersion = v1alpha1.APIVersion
 	out.Kind = v1alpha1.KindTask
 	out.Status = &v1alpha1.TaskStatus{Phase: v1alpha1.PhasePending}
-	return out
+	return out, nil
 }
 
 // timedOut reports whether the bounded wait expired while the caller is still
@@ -135,13 +144,14 @@ func timedOut(ctx, waitCtx context.Context) bool {
 // task, so the wait is bounded and a task nothing answers for is reported
 // unavailable rather than left hanging.
 func (c *Client) Get(ctx context.Context, atespace, name string) (*v1alpha1.Task, error) {
+	workflowID := workflows.TaskWorkflowID(atespaceOf(atespace), name)
 	queryCtx, cancel := context.WithTimeout(ctx, queryWait)
 	defer cancel()
 
-	value, err := c.client.QueryWorkflow(queryCtx, workflows.TaskWorkflowID(atespaceOf(atespace), name), "", workflows.QueryTask)
+	value, err := c.client.QueryWorkflow(queryCtx, workflowID, "", workflows.QueryTask)
 	if err != nil {
 		if timedOut(ctx, queryCtx) {
-			return nil, fmt.Errorf("%w: no worker answered for task %s/%s", orchestration.ErrTaskUnavailable, atespaceOf(atespace), name)
+			return nil, fmt.Errorf("%w: no worker answered for task %s", orchestration.ErrTaskUnavailable, workflowID)
 		}
 		return nil, mapError(err)
 	}
@@ -149,7 +159,29 @@ func (c *Client) Get(ctx context.Context, atespace, name string) (*v1alpha1.Task
 	if err := value.Get(&task); err != nil {
 		return nil, fmt.Errorf("decoding task %s/%s: %w", atespace, name, err)
 	}
+	if gone, err := c.isGone(ctx, workflowID, &task); err != nil {
+		return nil, err
+	} else if gone {
+		return nil, fmt.Errorf("%w: %s", orchestration.ErrTaskNotFound, workflowID)
+	}
 	return &task, nil
+}
+
+// isGone reports whether a task that says it is terminating has actually
+// finished going. A workflow answers queries after it has closed, so the
+// execution itself is what says the sandbox is gone for good.
+func (c *Client) isGone(ctx context.Context, workflowID string, task *v1alpha1.Task) (bool, error) {
+	if task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
+		return false, nil
+	}
+	describeCtx, cancel := context.WithTimeout(ctx, queryWait)
+	defer cancel()
+
+	described, err := c.client.DescribeWorkflowExecution(describeCtx, workflowID, "")
+	if err != nil {
+		return false, mapError(err)
+	}
+	return described.GetWorkflowExecutionInfo().GetStatus() != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, nil
 }
 
 // List returns the tasks of an atespace. Visibility answers which tasks exist,
@@ -331,20 +363,22 @@ func mapError(err error) error {
 	}
 	// Only a worker can answer for a task. When none does, the task exists but
 	// nothing can speak for it, which is a different thing from it being gone.
+	// A task queue with no pollers is reported as a failed precondition, which
+	// is the shape of "worker may be down".
 	var unavailable *serviceerror.Unavailable
 	var deadline *serviceerror.DeadlineExceeded
 	var notReady *serviceerror.WorkflowNotReady
+	var precondition *serviceerror.FailedPrecondition
 	if errors.Is(err, context.DeadlineExceeded) ||
 		errors.As(err, &unavailable) ||
 		errors.As(err, &deadline) ||
-		errors.As(err, &notReady) {
+		errors.As(err, &notReady) ||
+		errors.As(err, &precondition) {
 		return fmt.Errorf("%w: %s", orchestration.ErrTaskUnavailable, err)
 	}
 	var appErr *temporal.ApplicationError
 	if errors.As(err, &appErr) {
 		switch appErr.Type() {
-		case workflows.ErrTypeTaskDeleted:
-			return fmt.Errorf("%w: %s", orchestration.ErrTaskNotFound, appErr.Message())
 		case workflows.ErrTypeTaskTerminating:
 			return fmt.Errorf("%w: %s", orchestration.ErrTaskTerminating, appErr.Message())
 		case workflows.ErrTypeInvalidTask:

@@ -89,6 +89,11 @@ suspended.
 | Query | `task` | none | Metadata, spec, and status |
 | Query | `status` | none | Status only |
 
+A workflow answers queries after it has closed, so a task that has been deleted
+would still describe itself. `GetTask` therefore treats a task that reports
+`Terminating` as gone once its execution is no longer running, and `ListTasks`
+only asks about running ones.
+
 Every update has a validator, and every validator only reads state: it rejects a
 change to a task that is being deleted, and a spec that cannot be applied, before
 the request is written to history.
@@ -237,14 +242,22 @@ temporal operator search-attribute create --name AxAtespace --type Keyword
 # 3. Redis for the configuration kinds.
 docker run -p 6379:6379 redis:7-alpine
 
-# 4. The worker and the API server.
-go run ./cmd/ax-controller --substrate-endpoint=<substrate> --substrate-plaintext
+# 4. Agent Substrate, or the fake that stands in for it.
+go run ./internal/substrate/substratetest/cmd/fakecontrol
+
+# 5. The worker and the API server.
+go run ./cmd/ax-controller --substrate-endpoint=127.0.0.1:9001 --substrate-plaintext
 go run ./cmd/ax-server
 
-# 5. Anything you would normally do.
-ax apply -f examples/task.yaml
-ax watch task task123
+# 6. Anything you would normally do.
+ax --server=localhost:8080 apply -f examples/task.yaml
+ax --server=localhost:8080 get tasks
+ax --server=localhost:8080 delete task task123
 ```
+
+The fake Control API accepts every call and reports actors as running on a
+sandbox it also serves, so tasks reach `Running` with `WorkspaceReady` True.
+Point step 5 at a real Substrate to do the same thing for real.
 
 The Temporal UI at `http://localhost:8233` shows one workflow per task, its
 whole history, and its pending updates.

@@ -500,10 +500,13 @@ func (s *taskWorkflowSuite) TestDeleteTearsDownAndRejectsFurtherChanges() {
 	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.delActors))
 	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.delTmpl))
 
-	// Once the task is gone the query reports it as such.
-	_, err := s.env.QueryWorkflow(workflows.QueryTask)
-	s.Require().Error(err)
-	s.Contains(err.Error(), "no longer exists")
+	// The task ends on the Terminating phase, and its execution has closed, which
+	// is what tells the API server the task is gone.
+	value, err := s.env.QueryWorkflow(workflows.QueryTask)
+	s.Require().NoError(err)
+	var task v1alpha1.Task
+	s.Require().NoError(value.Get(&task))
+	s.Equal(v1alpha1.PhaseTerminating, task.GetStatus().GetPhase())
 }
 
 func (s *taskWorkflowSuite) TestCancellationReleasesTheSandbox() {

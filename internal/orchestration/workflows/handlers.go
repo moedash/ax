@@ -70,19 +70,14 @@ func (r *taskRun) registerHandlers(ctx workflow.Context) error {
 	return nil
 }
 
-// queryTask returns the whole task. A deleted task is reported as gone so that
-// the API server can answer NotFound while the workflow finishes closing.
+// queryTask returns the whole task. A task that has been torn down answers with
+// the Terminating phase it ended on; its execution has closed by then, which is
+// how the API server knows the task is gone.
 func (r *taskRun) queryTask() (*v1alpha1.Task, error) {
-	if r.deleted {
-		return nil, taskDeleted(r.key())
-	}
 	return r.taskSnapshot(), nil
 }
 
 func (r *taskRun) queryStatus() (*v1alpha1.TaskStatus, error) {
-	if r.deleted {
-		return nil, taskDeleted(r.key())
-	}
 	return r.statusSnapshot(), nil
 }
 
@@ -185,10 +180,6 @@ func (r *taskRun) request() int {
 // Substrate, or until the task starts going away.
 func (r *taskRun) awaitHandled(ctx workflow.Context, target int) error {
 	return workflow.Await(ctx, func() bool { return r.handled >= target || r.deleting })
-}
-
-func taskDeleted(key string) error {
-	return temporal.NewApplicationError(fmt.Sprintf("task %s no longer exists", key), ErrTypeTaskDeleted)
 }
 
 func taskTerminating(key string) error {
