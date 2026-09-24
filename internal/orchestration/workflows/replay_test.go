@@ -28,6 +28,7 @@ import (
 	"go.temporal.io/api/operatorservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
+	"go.temporal.io/sdk/workflow"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/google/ax/internal/orchestration/activities"
@@ -45,7 +46,10 @@ var historyFile = filepath.Join("testdata", "task_workflow_history.json")
 // that are already running.
 func TestReplayRecordedHistory(t *testing.T) {
 	replayer := worker.NewWorkflowReplayer()
-	replayer.RegisterWorkflow(workflows.TaskWorkflow)
+	replayer.RegisterWorkflowWithOptions(
+		workflows.NewTaskWorkflow(workflows.DefaultConfig()),
+		workflow.RegisterOptions{Name: workflows.TaskWorkflowType},
+	)
 
 	if err := replayer.ReplayWorkflowHistoryFromJSONFile(nil, historyFile); err != nil {
 		t.Fatalf("replaying %s: %v", historyFile, err)
@@ -90,9 +94,13 @@ func TestRecordHistory(t *testing.T) {
 
 	taskQueue := "ax-tasks-replay"
 	w := worker.New(temporalClient, taskQueue, worker.Options{})
-	w.RegisterWorkflow(workflows.TaskWorkflow)
+	w.RegisterWorkflowWithOptions(
+		workflows.NewTaskWorkflow(workflows.DefaultConfig()),
+		workflow.RegisterOptions{Name: workflows.TaskWorkflowType},
+	)
 	w.RegisterActivity(&activities.Activities{
 		Substrate:         substrateClient,
+		ReportCompletion:  true,
 		TemporalAddress:   address,
 		TemporalNamespace: "default",
 	})

@@ -24,8 +24,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
+	"go.temporal.io/sdk/workflow"
 
 	"github.com/google/ax/internal/orchestration/activities"
 	"github.com/google/ax/internal/orchestration/workflows"
@@ -48,17 +50,33 @@ type calls struct {
 	delActors  []string
 	delPolicy  []string
 	delTmpl    []string
+	delTmplOne []string
 	templateIn []activities.TemplateInput
+
+	// actorExists and actorTemplate stand in for Substrate binding an actor to
+	// the template it was created from.
+	actorExists   bool
+	actorTemplate string
+	// madeTemplates records which templates this fake has created, so a second
+	// pass over the same spec reports finding one rather than making it.
+	madeTemplates map[string]bool
 
 	// failures let a test make one step fail.
 	templateErr error
 	actorErr    error
 	policyErr   error
 	resumeErr   error
-	// workspaceReady is what the readiness poll reports.
+	// workspaceReady is what the readiness poll reports, unless probeAnswers
+	// has an answer queued for this call.
 	workspaceReady bool
+	probeAnswers   []bool
 	// observation is what a resync sees.
 	observation activities.ActorObservation
+
+	// gates hold an activity open so a test can land an update in the middle of
+	// a provisioning pass.
+	templateGate chan struct{}
+	probeGate    chan struct{}
 }
 
 func (c *calls) add(list *[]string, name string) {
@@ -101,8 +119,12 @@ func (s *taskWorkflowSuite) SetupTest() {
 	s.env.SetStartWorkflowOptions(client.StartWorkflowOptions{
 		ID: workflows.TaskWorkflowID("default", "test-task"),
 	})
-	s.calls = &calls{workspaceReady: true}
+	s.calls = &calls{workspaceReady: true, madeTemplates: map[string]bool{}}
 	s.mockActivities()
+	s.env.RegisterWorkflowWithOptions(
+		workflows.NewTaskWorkflow(workflows.DefaultConfig()),
+		workflow.RegisterOptions{Name: workflows.TaskWorkflowType},
+	)
 }
 
 // updateTask sends an update and captures the task its handler answered with.
@@ -153,24 +175,46 @@ func (s *taskWorkflowSuite) mockActivities() {
 		}).Maybe()
 
 	s.env.OnActivity(a.EnsureActorTemplate, mock.Anything, mock.Anything).Return(
-		func(ctx context.Context, in activities.TemplateInput) (activities.TemplateRef, error) {
+		func(ctx context.Context, in activities.TemplateInput) (activities.TemplateProvision, error) {
 			c.mu.Lock()
 			c.templates = append(c.templates, in.Template.Name)
 			c.templateIn = append(c.templateIn, in)
 			err := c.templateErr
+			gate := c.templateGate
+			created := !c.madeTemplates[in.Template.Name]
+			c.madeTemplates[in.Template.Name] = true
 			c.mu.Unlock()
-			if err != nil {
-				return activities.TemplateRef{}, err
+			if gate != nil {
+				<-gate
 			}
-			return in.Template, nil
+			if err != nil {
+				return activities.TemplateProvision{}, err
+			}
+			return activities.TemplateProvision{Created: created, Template: in.Template}, nil
 		}).Maybe()
 
 	s.env.OnActivity(a.EnsureActor, mock.Anything, mock.Anything).Return(
-		func(ctx context.Context, in activities.ActorInput) error {
-			c.add(&c.actors, in.Actor.Name)
+		func(ctx context.Context, in activities.ActorInput) (activities.ActorProvision, error) {
 			c.mu.Lock()
 			defer c.mu.Unlock()
-			return c.actorErr
+			c.actors = append(c.actors, in.Actor.Name)
+			if c.actorErr != nil {
+				return activities.ActorProvision{}, c.actorErr
+			}
+			if c.actorExists {
+				// Substrate keeps an actor on the template it was created from.
+				return activities.ActorProvision{
+					Template: activities.TemplateRef{Atespace: in.Actor.Atespace, Name: c.actorTemplate},
+					State:    activities.ActorStateRunning,
+				}, nil
+			}
+			c.actorExists = true
+			c.actorTemplate = in.Template.Name
+			return activities.ActorProvision{
+				Created:  true,
+				Template: in.Template,
+				State:    activities.ActorStateSuspended,
+			}, nil
 		}).Maybe()
 
 	s.env.OnActivity(a.ApplyEgressPolicy, mock.Anything, mock.Anything).Return(
@@ -200,10 +244,18 @@ func (s *taskWorkflowSuite) mockActivities() {
 
 	s.env.OnActivity(a.AwaitWorkspaceReady, mock.Anything, mock.Anything).Return(
 		func(ctx context.Context, in activities.WorkspaceReadyInput) (bool, error) {
-			c.add(&c.probes, in.WorkerIP)
 			c.mu.Lock()
-			defer c.mu.Unlock()
-			return c.workspaceReady, nil
+			c.probes = append(c.probes, in.WorkerIP)
+			ready := c.workspaceReady
+			if len(c.probeAnswers) > 0 {
+				ready, c.probeAnswers = c.probeAnswers[0], c.probeAnswers[1:]
+			}
+			gate := c.probeGate
+			c.mu.Unlock()
+			if gate != nil {
+				<-gate
+			}
+			return ready, nil
 		}).Maybe()
 
 	s.env.OnActivity(a.ObserveActor, mock.Anything, mock.Anything).Return(
@@ -216,7 +268,20 @@ func (s *taskWorkflowSuite) mockActivities() {
 
 	s.env.OnActivity(a.DeleteActorIfExists, mock.Anything, mock.Anything).Return(
 		func(ctx context.Context, in activities.ActorRef) error {
-			c.add(&c.delActors, in.Name)
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.delActors = append(c.delActors, in.Name)
+			c.actorExists = false
+			c.actorTemplate = ""
+			return nil
+		}).Maybe()
+
+	s.env.OnActivity(a.DeleteActorTemplateIfExists, mock.Anything, mock.Anything).Return(
+		func(ctx context.Context, in activities.TemplateRef) error {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.delTmplOne = append(c.delTmplOne, in.Name)
+			delete(c.madeTemplates, in.Name)
 			return nil
 		}).Maybe()
 
@@ -293,7 +358,7 @@ func (s *taskWorkflowSuite) TestProvisionsAndRuns() {
 	}, time.Second)
 	s.delete(2 * time.Second)
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, testInput())
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
 
 	s.True(s.env.IsWorkflowCompleted())
 	s.NoError(s.env.GetWorkflowError())
@@ -324,7 +389,7 @@ func (s *taskWorkflowSuite) TestProvisionsAndRuns() {
 func (s *taskWorkflowSuite) TestTemplateNameIsDerivedFromTheSpec() {
 	s.delete(time.Second)
 	in := testInput()
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, in)
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, in)
 	s.Require().NoError(s.env.GetWorkflowError())
 
 	got, ok := s.calls.lastTemplateInput()
@@ -344,7 +409,7 @@ func (s *taskWorkflowSuite) TestActorFailureRollsBackProvisioning() {
 	s.updateTask(time.Second, workflows.UpdateApply, "apply-1", &failed, testInput().Desired)
 	s.delete(2 * time.Second)
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, testInput())
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
 	s.Require().NoError(s.env.GetWorkflowError())
 
 	s.NotEmpty(s.calls.get(&s.calls.actors))
@@ -365,7 +430,7 @@ func (s *taskWorkflowSuite) TestEgressFailureRollsBackARestrictedTask() {
 	s.updateTask(time.Second, workflows.UpdateApply, "apply-1", &failed, testInput().Desired)
 	s.delete(2 * time.Second)
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, testInput())
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
 	s.Require().NoError(s.env.GetWorkflowError())
 
 	s.Contains(s.calls.get(&s.calls.delPolicy), "test-task")
@@ -391,7 +456,7 @@ func (s *taskWorkflowSuite) TestEgressFailureIsToleratedWithoutAGateway() {
 	s.updateTask(time.Second, workflows.UpdateApply, "apply-1", &applied, in.Desired)
 	s.delete(2 * time.Second)
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, in)
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, in)
 	s.Require().NoError(s.env.GetWorkflowError())
 
 	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.resumes))
@@ -406,7 +471,7 @@ func (s *taskWorkflowSuite) TestSuspendAndResume() {
 	s.updateTask(2*time.Second, workflows.UpdateResume, "resume-1", &resumedTask)
 	s.delete(3 * time.Second)
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, testInput())
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
 	s.Require().NoError(s.env.GetWorkflowError())
 
 	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.suspends))
@@ -444,7 +509,7 @@ func (s *taskWorkflowSuite) TestCompleteRecordsTheExitCode() {
 	}, 2*time.Second)
 	s.delete(3 * time.Second)
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, testInput())
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
 	s.Require().NoError(s.env.GetWorkflowError())
 
 	s.Require().NotNil(completed)
@@ -469,7 +534,7 @@ func (s *taskWorkflowSuite) TestCompletionSignalRecordsTheExitCode() {
 	}, 2*time.Second)
 	s.delete(3 * time.Second)
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, testInput())
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
 	s.Require().NoError(s.env.GetWorkflowError())
 
 	s.Require().NotNil(completed)
@@ -493,7 +558,7 @@ func (s *taskWorkflowSuite) TestDeleteTearsDownAndRejectsFurtherChanges() {
 		s.True(rejected, "suspend should be rejected while the task is terminating")
 	}, 2*time.Second)
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, testInput())
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
 
 	s.True(s.env.IsWorkflowCompleted())
 	s.NoError(s.env.GetWorkflowError())
@@ -514,7 +579,7 @@ func (s *taskWorkflowSuite) TestCancellationReleasesTheSandbox() {
 		s.env.CancelWorkflow()
 	}, time.Second)
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, testInput())
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
 
 	s.True(s.env.IsWorkflowCompleted())
 	s.Error(s.env.GetWorkflowError(), "a cancelled workflow reports the cancellation")
@@ -535,7 +600,7 @@ func (s *taskWorkflowSuite) TestResyncReplacesACrashedSandbox() {
 	}, 6*time.Minute)
 	s.delete(6*time.Minute + time.Second)
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, testInput())
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
 	s.Require().NoError(s.env.GetWorkflowError())
 
 	s.NotEmpty(s.calls.get(&s.calls.observes))
@@ -567,7 +632,7 @@ func (s *taskWorkflowSuite) TestContinuedRunKeepsTheSandbox() {
 	}, time.Second)
 	s.delete(2 * time.Second)
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, in)
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, in)
 	s.Require().NoError(s.env.GetWorkflowError())
 
 	// Provisioning runs again because it is idempotent, but the workspace is not
@@ -585,7 +650,7 @@ func (s *taskWorkflowSuite) TestInvalidTaskIsRejected() {
 		{Name: "b", Path: "/same"},
 	}
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, in)
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, in)
 
 	s.True(s.env.IsWorkflowCompleted())
 	err := s.env.GetWorkflowError()
@@ -632,7 +697,7 @@ func (s *taskWorkflowSuite) TestResyncRechecksAWorkspaceThatWasStillInitializing
 	}, 6*time.Minute)
 	s.delete(6*time.Minute + time.Second)
 
-	s.env.ExecuteWorkflow(workflows.TaskWorkflow, testInput())
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
 	s.Require().NoError(s.env.GetWorkflowError())
 
 	s.Require().NotNil(initializing)
@@ -645,4 +710,158 @@ func (s *taskWorkflowSuite) TestResyncRechecksAWorkspaceThatWasStillInitializing
 	assertCondition(s.T(), ready, v1alpha1.ConditionReady, v1alpha1.ConditionTrue, "TaskRunning")
 	// The sandbox itself was never rebuilt.
 	s.Len(s.calls.get(&s.calls.actors), 1)
+}
+
+// Substrate binds an actor to the template it was created from, so applying a
+// new spec has to replace the sandbox for the change to take effect.
+func (s *taskWorkflowSuite) TestApplyReplacesTheSandboxForANewSpec() {
+	changed := testInput()
+	changed.Desired.Task.Spec.Image = "ghcr.io/example/agent:v2"
+
+	var replaced *v1alpha1.Task
+	s.updateTask(time.Second, workflows.UpdateApply, "apply-1", &replaced, changed.Desired)
+	s.delete(2 * time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	templates := s.calls.get(&s.calls.templates)
+	s.Require().GreaterOrEqual(len(templates), 2)
+	s.NotEqual(templates[0], templates[len(templates)-1], "a new image is a new template")
+	s.Equal(
+		activities.TaskTemplateName(changed.Desired.Task, changed.Desired.Workspaces),
+		templates[len(templates)-1],
+	)
+	// One delete to replace the sandbox, one to tear the task down.
+	s.Len(s.calls.get(&s.calls.delActors), 2)
+	s.Len(s.calls.get(&s.calls.probes), 2, "the replacement sandbox is probed for itself")
+
+	s.Require().NotNil(replaced)
+	s.Equal("ghcr.io/example/agent:v2", replaced.GetSpec().GetImage())
+	s.Equal(v1alpha1.PhaseRunning, replaced.GetStatus().GetPhase())
+}
+
+// A pass that finds a sandbox it did not create must not roll it back.
+func (s *taskWorkflowSuite) TestReprovisionLeavesASandboxItDidNotCreate() {
+	// A different gateway changes what has to be applied to the sandbox, not
+	// what the sandbox is made of, so the actor and its template stay.
+	changed := testInput()
+	changed.Desired.Gateway.Spec.Egress.Allowlist.Hosts = []*v1alpha1.HostRule{{Host: "example.com", Port: 443}}
+
+	s.env.RegisterDelayedCallback(func() {
+		s.calls.mu.Lock()
+		s.calls.policyErr = temporal.NewNonRetryableApplicationError(
+			"policy rejected", activities.ErrTypePermanent, nil)
+		s.calls.mu.Unlock()
+	}, time.Second)
+	var failed *v1alpha1.Task
+	s.updateTask(2*time.Second, workflows.UpdateApply, "apply-1", &failed, changed.Desired)
+	s.delete(3 * time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.Require().NotNil(failed)
+	s.Equal(v1alpha1.PhaseFailed, failed.GetStatus().GetPhase())
+	s.Len(s.calls.get(&s.calls.delActors), 1, "only the teardown deletes the actor")
+	s.Empty(s.calls.get(&s.calls.delTmplOne), "a template the pass found is left alone")
+	s.Empty(s.calls.get(&s.calls.delPolicy), "the policy of a sandbox the pass found is left alone")
+}
+
+// A spec that arrives while a pass is running belongs to the next pass, not to
+// half of this one.
+func (s *taskWorkflowSuite) TestApplyDuringProvisioningIsNotHalfApplied() {
+	gate := make(chan struct{})
+	s.calls.templateGate = gate
+
+	changed := testInput()
+	changed.Desired.Task.Spec.Image = "ghcr.io/example/agent:v2"
+
+	var applied *v1alpha1.Task
+	s.updateTask(time.Second, workflows.UpdateApply, "apply-1", &applied, changed.Desired)
+	s.env.RegisterDelayedCallback(func() { close(gate) }, 2*time.Second)
+	s.delete(3 * time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	last, ok := s.calls.lastTemplateInput()
+	s.Require().True(ok)
+	s.Equal("ghcr.io/example/agent:v2", last.Image, "the new spec is built by a pass of its own")
+	s.Equal(
+		activities.TaskTemplateName(changed.Desired.Task, changed.Desired.Workspaces),
+		last.Template.Name,
+	)
+	s.Require().NotNil(applied)
+	s.Equal("ghcr.io/example/agent:v2", applied.GetSpec().GetImage())
+}
+
+// An answer from a sandbox that has since been replaced says nothing about its
+// replacement.
+func (s *taskWorkflowSuite) TestAProbeForAReplacedSandboxIsDropped() {
+	gate := make(chan struct{})
+	s.calls.probeGate = gate
+	// The first sandbox reports not ready, the replacement reports ready, and
+	// both answers arrive after the replacement.
+	s.calls.probeAnswers = []bool{false, true}
+
+	changed := testInput()
+	changed.Desired.Task.Spec.Image = "ghcr.io/example/agent:v2"
+
+	var replaced *v1alpha1.Task
+	var settled *v1alpha1.TaskStatus
+	s.updateTask(time.Second, workflows.UpdateApply, "apply-1", &replaced, changed.Desired)
+	s.env.RegisterDelayedCallback(func() { close(gate) }, 2*time.Second)
+	s.env.RegisterDelayedCallback(func() { settled = s.queryStatus() }, 3*time.Second)
+	s.delete(4 * time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.Len(s.calls.get(&s.calls.probes), 2, "the replacement gets a probe of its own")
+	s.Require().NotNil(settled)
+	assertCondition(s.T(), settled, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue, "SetupComplete")
+}
+
+// A task that continues as new answers the update it was given first.
+func (s *taskWorkflowSuite) TestContinueAsNewFinishesAnAdmittedUpdate() {
+	s.env.SetContinueAsNewSuggested(true)
+
+	var suspended *v1alpha1.Task
+	s.updateTask(0, workflows.UpdateSuspend, "suspend-1", &suspended)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+
+	s.True(s.env.IsWorkflowCompleted())
+	var continued *workflow.ContinueAsNewError
+	s.Require().ErrorAs(s.env.GetWorkflowError(), &continued)
+
+	s.Require().NotNil(suspended, "the update is answered before the run ends")
+	s.Equal(v1alpha1.PhaseSuspended, suspended.GetStatus().GetPhase())
+	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.suspends), "and its effect landed")
+}
+
+// A completion left in the channel goes into the next run instead of down with
+// this one.
+func (s *taskWorkflowSuite) TestContinueAsNewKeepsABufferedCompletion() {
+	s.env.SetContinueAsNewSuggested(true)
+	s.env.RegisterDelayedCallback(func() {
+		// Buffered without running workflow code, so it is still in the channel
+		// when the run is on its way out.
+		s.env.SignalWorkflowSkippingWorkflowTask(workflows.SignalComplete, workflows.CompleteInput{ExitCode: 9})
+		s.env.SignalWorkflow(workflows.SignalComplete, workflows.CompleteInput{ExitCode: 9})
+	}, 0)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+
+	s.True(s.env.IsWorkflowCompleted())
+	var continued *workflow.ContinueAsNewError
+	s.Require().ErrorAs(s.env.GetWorkflowError(), &continued)
+
+	var next workflows.TaskWorkflowInput
+	s.Require().NoError(converter.GetDefaultDataConverter().FromPayloads(continued.Input, &next))
+	s.Require().NotNil(next.Status)
+	s.Require().NotNil(next.Status.ExitCode)
+	s.Equal(int32(9), next.Status.GetExitCode())
+	s.Equal(v1alpha1.PhaseCompleted, next.Status.GetPhase())
 }

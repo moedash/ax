@@ -22,10 +22,12 @@ import (
 	"flag"
 	"log/slog"
 	"os"
+	"time"
 
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/worker"
+	"go.temporal.io/sdk/workflow"
 
 	"github.com/google/ax/internal/model"
 	"github.com/google/ax/internal/orchestration/activities"
@@ -46,10 +48,12 @@ const (
 
 func main() {
 	var (
+		resyncInterval       time.Duration
 		temporalAddress      string
 		temporalNamespace    string
 		taskQueue            string
 		sandboxAddress       string
+		reportCompletion     bool
 		substrateEndpoint    string
 		substrateAuthority   string
 		substrateTokenFile   string
@@ -61,6 +65,8 @@ func main() {
 	flag.StringVar(&temporalAddress, "temporal-address", defaultTemporalAddress, "Temporal frontend address")
 	flag.StringVar(&temporalNamespace, "temporal-namespace", defaultTemporalNamespace, "Temporal namespace")
 	flag.StringVar(&taskQueue, "task-queue", defaultTaskQueue, "Task queue this worker polls")
+	flag.DurationVar(&resyncInterval, "resync-interval", 0, "How often a settled task checks its sandbox against Substrate (0 uses the built-in default). Each interval costs one read per task.")
+	flag.BoolVar(&reportCompletion, "sandbox-report-completion", false, "Let task containers report their command's exit to their own workflow. This gives anything in a sandbox a route to the Temporal frontend, so it is only as safe as the frontend's authentication.")
 	flag.StringVar(&sandboxAddress, "sandbox-temporal-address", "", "Temporal address task containers dial to report their command's exit (defaults to --temporal-address)")
 	flag.StringVar(&substrateEndpoint, "substrate-endpoint", "api.ate-system.svc.cluster.local:443", "Agent Substrate Control API endpoint")
 	flag.StringVar(&substrateAuthority, "substrate-authority", "api.ate-system.svc", "Authority / TLS ServerName for Substrate endpoint")
@@ -86,10 +92,17 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
+	workflowConfig := workflows.DefaultConfig()
+	if resyncInterval > 0 {
+		workflowConfig.ResyncInterval = resyncInterval
+	}
+
 	slog.Info("starting ax-controller",
 		"temporalAddress", temporalAddress,
+		"resyncInterval", workflowConfig.ResyncInterval,
 		"temporalNamespace", temporalNamespace,
 		"taskQueue", taskQueue,
+		"sandboxReportCompletion", reportCompletion,
 		"substrateEndpoint", substrateEndpoint,
 		"authority", substrateAuthority,
 	)
@@ -122,11 +135,17 @@ func main() {
 	w := worker.New(temporalClient, taskQueue, worker.Options{
 		MaxConcurrentActivityExecutionSize: maxConcurrentActivities,
 	})
-	w.RegisterWorkflow(workflows.TaskWorkflow)
+	// Registered under the workflow type rather than the function, so workers
+	// with different settings still answer for the same tasks.
+	w.RegisterWorkflowWithOptions(
+		workflows.NewTaskWorkflow(workflowConfig),
+		workflow.RegisterOptions{Name: workflows.TaskWorkflowType},
+	)
 	w.RegisterActivity(&activities.Activities{
 		Substrate:         subClient,
 		SecretResolver:    model.GetKubernetesSecret,
 		RouterAddr:        os.Getenv("ATENET_ROUTER_ADDR"),
+		ReportCompletion:  reportCompletion,
 		TemporalAddress:   sandboxAddress,
 		TemporalNamespace: temporalNamespace,
 	})
