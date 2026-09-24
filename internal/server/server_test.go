@@ -422,3 +422,52 @@ func TestWatchTaskStreamsUntilReady(t *testing.T) {
 		t.Errorf("expected the stream to end once the task is ready, got %v", err)
 	}
 }
+
+// A name or atespace ends up in Substrate resource names, in HTTP headers, and
+// in the queries the control plane builds, so the API rejects anything that is
+// not a DNS label, for every kind alike.
+func TestUpdateRejectsNamesThatAreNotDNSLabels(t *testing.T) {
+	srv := server.NewServer(memory.NewStore(), newFakeTasks(), server.Options{})
+	ctx := context.Background()
+
+	const bad = "job' OR '1'='1"
+
+	if _, err := srv.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: bad},
+		Spec:     &v1alpha1.TaskSpec{},
+	}}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("expected InvalidArgument for a task name with a quote, got %v", err)
+	}
+	if _, err := srv.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: bad},
+		Spec:     &v1alpha1.TaskSpec{},
+	}}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("expected InvalidArgument for an atespace with a quote, got %v", err)
+	}
+	if _, err := srv.UpdateGateway(ctx, &v1alpha1.UpdateGatewayRequest{Gateway: &v1alpha1.Gateway{
+		Metadata: &v1alpha1.ObjectMeta{Name: bad},
+		Spec:     &v1alpha1.GatewaySpec{},
+	}}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("expected InvalidArgument for a gateway name with a quote, got %v", err)
+	}
+	if _, err := srv.UpdateWorkspace(ctx, &v1alpha1.UpdateWorkspaceRequest{Workspace: &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: bad},
+		Spec:     &v1alpha1.WorkspaceSpec{},
+	}}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("expected InvalidArgument for a workspace name with a quote, got %v", err)
+	}
+	if _, err := srv.UpdateModel(ctx, &v1alpha1.UpdateModelRequest{Model: &v1alpha1.Model{
+		Metadata: &v1alpha1.ObjectMeta{Name: bad},
+		Spec:     &v1alpha1.ModelSpec{},
+	}}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("expected InvalidArgument for a model name with a quote, got %v", err)
+	}
+
+	// A name that is a DNS label is still accepted, with the atespace defaulted.
+	if _, err := srv.UpdateGateway(ctx, &v1alpha1.UpdateGatewayRequest{Gateway: &v1alpha1.Gateway{
+		Metadata: &v1alpha1.ObjectMeta{Name: "gw-1"},
+		Spec:     &v1alpha1.GatewaySpec{},
+	}}); err != nil {
+		t.Errorf("expected a valid gateway to be accepted, got %v", err)
+	}
+}
