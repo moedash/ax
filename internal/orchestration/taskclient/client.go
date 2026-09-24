@@ -54,11 +54,20 @@ const (
 type Client struct {
 	client    sdkclient.Client
 	taskQueue string
+	// changeWait and queryWait bound the two waits. They are fields so a test
+	// does not have to sit through them.
+	changeWait time.Duration
+	queryWait  time.Duration
 }
 
 // New returns a client that starts task workflows on the given task queue.
 func New(c sdkclient.Client, taskQueue string) *Client {
-	return &Client{client: c, taskQueue: taskQueue}
+	return &Client{
+		client:     c,
+		taskQueue:  taskQueue,
+		changeWait: changeWait,
+		queryWait:  queryWait,
+	}
 }
 
 // Apply creates or updates a task. Creating and updating are the same call: the
@@ -85,7 +94,7 @@ func (c *Client) Apply(ctx context.Context, desired *workflows.TaskDesiredState)
 	// An update is only accepted by a worker, so the wait is bounded: the task
 	// has been created either way, and a control plane with no workers must not
 	// hold the caller.
-	waitCtx, cancel := context.WithTimeout(ctx, changeWait)
+	waitCtx, cancel := context.WithTimeout(ctx, c.changeWait)
 	defer cancel()
 
 	handle, err := c.client.UpdateWithStartWorkflow(waitCtx, sdkclient.UpdateWithStartWorkflowOptions{
@@ -118,7 +127,7 @@ func (c *Client) Apply(ctx context.Context, desired *workflows.TaskDesiredState)
 // says nothing about whether the task was created: the execution is asked for
 // directly, and the task is reported Pending only if it is really there.
 func (c *Client) acceptedTask(ctx context.Context, workflowID string, task *v1alpha1.Task) (*v1alpha1.Task, error) {
-	describeCtx, cancel := context.WithTimeout(ctx, queryWait)
+	describeCtx, cancel := context.WithTimeout(ctx, c.queryWait)
 	defer cancel()
 
 	if _, err := c.client.DescribeWorkflowExecution(describeCtx, workflowID, ""); err != nil {
@@ -145,7 +154,7 @@ func timedOut(ctx, waitCtx context.Context) bool {
 // unavailable rather than left hanging.
 func (c *Client) Get(ctx context.Context, atespace, name string) (*v1alpha1.Task, error) {
 	workflowID := workflows.TaskWorkflowID(atespaceOf(atespace), name)
-	queryCtx, cancel := context.WithTimeout(ctx, queryWait)
+	queryCtx, cancel := context.WithTimeout(ctx, c.queryWait)
 	defer cancel()
 
 	value, err := c.client.QueryWorkflow(queryCtx, workflowID, "", workflows.QueryTask)
@@ -174,7 +183,7 @@ func (c *Client) isGone(ctx context.Context, workflowID string, task *v1alpha1.T
 	if task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
 		return false, nil
 	}
-	describeCtx, cancel := context.WithTimeout(ctx, queryWait)
+	describeCtx, cancel := context.WithTimeout(ctx, c.queryWait)
 	defer cancel()
 
 	described, err := c.client.DescribeWorkflowExecution(describeCtx, workflowID, "")
@@ -223,7 +232,7 @@ func (c *Client) List(ctx context.Context, atespace string, limit, offset int64)
 func (c *Client) describe(ctx context.Context, execution *workflowpb.WorkflowExecutionInfo) (*v1alpha1.Task, bool) {
 	id := execution.GetExecution().GetWorkflowId()
 
-	queryCtx, cancel := context.WithTimeout(ctx, queryWait)
+	queryCtx, cancel := context.WithTimeout(ctx, c.queryWait)
 	defer cancel()
 
 	value, err := c.client.QueryWorkflow(queryCtx, id, "", workflows.QueryTask)
@@ -313,7 +322,7 @@ func (c *Client) Resume(ctx context.Context, atespace, name string) (*v1alpha1.T
 // task whose worker does not answer in that time is reported unavailable rather
 // than left hanging.
 func (c *Client) change(ctx context.Context, atespace, name, update string) (*v1alpha1.Task, error) {
-	waitCtx, cancel := context.WithTimeout(ctx, changeWait)
+	waitCtx, cancel := context.WithTimeout(ctx, c.changeWait)
 	defer cancel()
 
 	handle, err := c.client.UpdateWorkflow(waitCtx, sdkclient.UpdateWorkflowOptions{
@@ -343,7 +352,7 @@ func (c *Client) changeError(ctx, waitCtx context.Context, atespace, name string
 // request to be accepted: tearing a sandbox down can take a while, and callers
 // watch the task until it disappears.
 func (c *Client) Delete(ctx context.Context, atespace, name string) error {
-	waitCtx, cancel := context.WithTimeout(ctx, changeWait)
+	waitCtx, cancel := context.WithTimeout(ctx, c.changeWait)
 	defer cancel()
 
 	_, err := c.client.UpdateWorkflow(waitCtx, sdkclient.UpdateWorkflowOptions{
