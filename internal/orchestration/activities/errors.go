@@ -40,6 +40,18 @@ func invalidSpec(format string, args ...any) error {
 	return temporal.NewNonRetryableApplicationError(fmt.Sprintf(format, args...), ErrTypeInvalidSpec, nil)
 }
 
+// classifyTemplateDeletion is classify with one exception. Substrate refuses to
+// delete an actor template while an actor still derives from it, and that
+// refusal clears as soon as the actor is gone, so it is worth retrying even
+// though the same code means something permanent elsewhere.
+func classifyTemplateDeletion(err error) error {
+	switch status.Code(err) {
+	case codes.FailedPrecondition, codes.Aborted:
+		return temporal.NewApplicationErrorWithCause(err.Error(), ErrTypeSubstrate, err)
+	}
+	return classify(err)
+}
+
 // classify turns a Substrate error into a Temporal error whose type says
 // whether retrying can help.
 //

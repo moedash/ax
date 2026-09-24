@@ -50,7 +50,7 @@ func (r *taskRun) registerHandlers(ctx workflow.Context) error {
 		return err
 	}
 	if err := workflow.SetUpdateHandlerWithOptions(ctx, UpdateDelete, r.handleDelete,
-		workflow.UpdateHandlerOptions{}); err != nil {
+		workflow.UpdateHandlerOptions{Validator: r.validateDelete}); err != nil {
 		return err
 	}
 
@@ -161,12 +161,33 @@ func (r *taskRun) validateComplete(ctx workflow.Context, in CompleteInput) error
 
 // handleDelete tears the sandbox down and ends the task. It returns once the
 // record is gone, so a caller that waits for the update sees a task that no
-// longer exists.
+// longer exists. A teardown that cannot finish answers with what was left
+// behind, and the task stays.
 func (r *taskRun) handleDelete(ctx workflow.Context) error {
+	failures := r.teardownFailures
 	r.deleting = true
+	r.teardownFailed = false
 	r.request()
 	r.syncPhase()
-	return workflow.Await(ctx, func() bool { return r.deleted })
+
+	if err := workflow.Await(ctx, func() bool {
+		return r.deleted || r.teardownFailures > failures
+	}); err != nil {
+		return err
+	}
+	if !r.deleted {
+		return temporal.NewApplicationError(r.teardownMessage, ErrTypeTeardownFailed)
+	}
+	return nil
+}
+
+// validateDelete rejects a delete for a task that has already gone.
+func (r *taskRun) validateDelete(ctx workflow.Context) error {
+	if r.deleted {
+		return temporal.NewApplicationError(
+			fmt.Sprintf("task %s no longer exists", r.key()), ErrTypeTaskDeleted)
+	}
+	return nil
 }
 
 // request records that something asked for a change and returns the number the

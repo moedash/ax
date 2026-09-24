@@ -63,6 +63,11 @@ const (
 const (
 	// ErrTypeTaskTerminating rejects updates to a task that is going away.
 	ErrTypeTaskTerminating = "TaskTerminating"
+	// ErrTypeTaskDeleted rejects a change to a task that has already gone.
+	ErrTypeTaskDeleted = "TaskDeleted"
+	// ErrTypeTeardownFailed answers a delete whose sandbox could not be
+	// released. The task is still there and still deletable.
+	ErrTypeTeardownFailed = "TeardownFailed"
 	// ErrTypeInvalidTask rejects an update whose task spec cannot be applied.
 	ErrTypeInvalidTask = "InvalidTask"
 	// ErrTypeUnsupportedVersion is returned when a task's recorded provisioning

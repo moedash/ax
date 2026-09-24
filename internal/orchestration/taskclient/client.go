@@ -402,6 +402,8 @@ func mapError(err error) error {
 	var appErr *temporal.ApplicationError
 	if errors.As(err, &appErr) {
 		switch appErr.Type() {
+		case workflows.ErrTypeTaskDeleted:
+			return fmt.Errorf("%w: %s", orchestration.ErrTaskNotFound, appErr.Message())
 		case workflows.ErrTypeTaskTerminating:
 			return fmt.Errorf("%w: %s", orchestration.ErrTaskTerminating, appErr.Message())
 		case workflows.ErrTypeInvalidTask:

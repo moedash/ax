@@ -115,56 +115,63 @@ func runTask(ctx workflow.Context, cfg Config, in TaskWorkflowInput) error {
 	// workflow that owns it.
 	defer r.releaseOnCancel(ctx)
 
-	for !r.deleting {
-		handling := r.requests
-		r.converge(ctx)
-		r.handled = handling
+	// The outer turn is the task's life: it ends only when the sandbox is
+	// really gone. A teardown that cannot finish puts the task back in the
+	// inner loop, where a later delete tries again.
+	for !r.deleted {
+		for !r.deleting {
+			handling := r.requests
+			r.converge(ctx)
+			r.handled = handling
 
-		if r.deleting {
-			break
-		}
-		// Workspace setup inside the sandbox takes as long as a maiden run takes,
-		// so it is waited for in the background: a caller asking for a change gets
-		// an answer as soon as the sandbox is in the state it asked for.
-		r.settleWorkspace(ctx)
-		if workflow.GetInfo(ctx).GetContinueAsNewSuggested() {
-			r.drainCompletions(ctx)
-			if r.pending() {
-				continue
+			if r.deleting {
+				break
 			}
-			// Wait for handlers to finish, but not past one that is waiting for
-			// the main loop: that one needs another pass, and waiting for it here
-			// would leave both sides waiting for each other.
-			if err := workflow.Await(ctx, func() bool {
-				return workflow.AllHandlersFinished(ctx) || r.pending()
-			}); err != nil {
+			// Workspace setup inside the sandbox takes as long as a maiden run
+			// takes, so it is waited for in the background: a caller asking for a
+			// change gets an answer as soon as the sandbox is in the state it
+			// asked for.
+			r.settleWorkspace(ctx)
+			if workflow.GetInfo(ctx).GetContinueAsNewSuggested() {
+				r.drainCompletions(ctx)
+				if r.pending() {
+					continue
+				}
+				// Wait for handlers to finish, but not past one that is waiting
+				// for the main loop: that one needs another pass, and waiting for
+				// it here would leave both sides waiting for each other.
+				if err := workflow.Await(ctx, func() bool {
+					return workflow.AllHandlersFinished(ctx) || r.pending()
+				}); err != nil {
+					return err
+				}
+				if r.pending() {
+					continue
+				}
+				// Anything signalled while we yielded above would go down with
+				// this run, so the channel is taken again on the way out.
+				r.drainCompletions(ctx)
+				logger.Info("continuing task workflow as new", "task", r.key())
+				return workflow.NewContinueAsNewError(ctx, TaskWorkflowType, r.continueInput())
+			}
+
+			requested, err := workflow.AwaitWithTimeout(ctx, cfg.ResyncInterval, r.pending)
+			if err != nil {
 				return err
 			}
-			if r.pending() {
-				continue
+			if !requested {
+				r.resync(ctx)
 			}
-			// Anything signalled while we yielded above would go down with this
-			// run, so the channel is taken again on the way out.
-			r.drainCompletions(ctx)
-			logger.Info("continuing task workflow as new", "task", r.key())
-			return workflow.NewContinueAsNewError(ctx, TaskWorkflowType, r.continueInput())
 		}
 
-		requested, err := workflow.AwaitWithTimeout(ctx, cfg.ResyncInterval, r.pending)
-		if err != nil {
-			return err
-		}
-		if !requested {
-			r.resync(ctx)
+		if err := r.teardown(ctx); err != nil {
+			logger.Error("task teardown failed; the task stays until it can be released",
+				"task", r.key(), "error", err)
 		}
 	}
 
-	teardownErr := r.teardown(ctx)
 	if err := r.awaitHandlers(ctx); err != nil {
 		return err
-	}
-	if teardownErr != nil {
-		return teardownErr
 	}
 	logger.Info("task deleted", "task", r.key())
 	return nil
@@ -199,6 +206,13 @@ type taskRun struct {
 	failed     bool
 	deleting   bool
 	deleted    bool
+	// teardownFailures counts the teardowns that could not finish, so the
+	// caller waiting on a delete is released by its own attempt failing.
+	teardownFailures int
+	teardownMessage  string
+	// teardownFailed keeps a task that could not be released reported as
+	// Failed, rather than sliding back to Running as if nothing had happened.
+	teardownFailed bool
 
 	completions workflow.ReceiveChannel
 }
@@ -472,6 +486,10 @@ func (r *taskRun) activate(ctx workflow.Context) error {
 // is running and the workspace inside it has finished setting up.
 func (r *taskRun) syncReady(ctx workflow.Context) {
 	switch {
+	case r.teardownFailed:
+		// The sandbox may well be running, but the task was asked to go and is
+		// still here, which is the thing worth reporting.
+		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TeardownFailed", r.teardownMessage)
 	case r.sandbox == sandboxSuspended:
 		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TaskSuspended", "Task is suspended")
 	case r.completed:
@@ -591,28 +609,43 @@ func (r *taskRun) forgetSandbox(ctx workflow.Context, reason, message string) {
 
 // teardown releases the task's Substrate resources. Templates can only go once
 // the actor that references them is gone, so the order matters.
+//
+// A task is only reported gone once its sandbox really is. Teardown that fails
+// leaves the task alive and Failed, naming what was left behind, so that the
+// API keeps answering for it and a later delete tries again.
 func (r *taskRun) teardown(ctx workflow.Context) error {
 	logger := workflow.GetLogger(ctx)
 	teardownCtx := workflow.WithActivityOptions(ctx, activities.TeardownOptions())
 	actor := r.actorRef()
 
 	logger.Info("tearing down task sandbox", "task", r.key())
-	var failure error
 	if err := workflow.ExecuteActivity(teardownCtx, acts.DeleteActorIfExists, actor).Get(teardownCtx, nil); err != nil {
 		logger.Error("could not delete the task actor", "task", r.key(), "error", err)
-		failure = err
-	} else if err := workflow.ExecuteActivity(teardownCtx, acts.DeleteActorTemplates,
+		r.failTeardown(ctx, fmt.Sprintf("Actor %s/%s is still there: %v", actor.Atespace, actor.Name, err))
+		return err
+	}
+	if err := workflow.ExecuteActivity(teardownCtx, acts.DeleteActorTemplates,
 		activities.TemplatesInput{Atespace: actor.Atespace, TaskName: actor.Name}).Get(teardownCtx, nil); err != nil {
 		logger.Error("could not delete the task actor templates", "task", r.key(), "error", err)
-		failure = err
+		r.failTeardown(ctx, fmt.Sprintf("Actor templates of %s/%s are still there: %v", actor.Atespace, actor.Name, err))
+		return err
 	}
 
-	// The record disappears either way. Leaving it behind would block a task of
-	// the same name from being created, and the failure is reported through the
-	// workflow's own result.
 	r.deleted = true
 	r.syncPhase()
-	return failure
+	return nil
+}
+
+// failTeardown puts the task back in reach after a teardown that could not
+// finish. The task stays deletable, and the condition names what Substrate
+// still holds so an operator can find it.
+func (r *taskRun) failTeardown(ctx workflow.Context, message string) {
+	r.deleting = false
+	r.teardownFailed = true
+	r.teardownFailures++
+	r.teardownMessage = message
+	r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TeardownFailed", message)
+	r.syncPhase()
 }
 
 // releaseOnCancel tears the sandbox down when the workflow is cancelled. The
@@ -667,12 +700,18 @@ func (r *taskRun) syncPhase() {
 	switch {
 	case r.deleting || r.deleted:
 		r.status.Phase = v1alpha1.PhaseTerminating
+	case r.teardownFailed:
+		// A task that was asked to go and could not is the operator's problem,
+		// whatever its sandbox is doing.
+		r.status.Phase = v1alpha1.PhaseFailed
+	case r.completed:
+		// How the command finished outlives what the sandbox is doing now, so a
+		// task that has run to its end says so.
+		r.status.Phase = v1alpha1.PhaseCompleted
 	case r.failed:
 		r.status.Phase = v1alpha1.PhaseFailed
 	case r.sandbox == sandboxSuspended:
 		r.status.Phase = v1alpha1.PhaseSuspended
-	case r.completed:
-		r.status.Phase = v1alpha1.PhaseCompleted
 	case r.status.GetWorkerIp() != "":
 		r.status.Phase = v1alpha1.PhaseRunning
 	default:

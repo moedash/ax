@@ -300,9 +300,17 @@ func (s *ControlServer) ListActorTemplates(ctx context.Context, req *ateapipb.Li
 func (s *ControlServer) DeleteActorTemplate(ctx context.Context, req *ateapipb.DeleteActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
 	name := req.GetActorTemplate().GetName()
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	for actor, template := range s.actorTmpl {
+		if template.GetName() != name {
+			continue
+		}
+		// A template an actor still derives from cannot go until the actor does.
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"actor template %q is still used by actor %q", name, actor)
+	}
 	delete(s.templates, name)
 	s.delTmpl = append(s.delTmpl, name)
-	s.mu.Unlock()
 	return &ateapipb.ActorTemplate{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }
 

@@ -506,3 +506,78 @@ func TestDeleteActorTemplateIfExists(t *testing.T) {
 		t.Fatalf("DeleteActorTemplateIfExists on a missing template failed: %v", err)
 	}
 }
+
+// Substrate refuses to delete a template an actor still derives from. That
+// refusal clears once the actor is gone, so it has to be retried, while the
+// same code from anywhere else is permanent.
+func TestTemplateDeletionIsRetriedWhileTheActorHoldsIt(t *testing.T) {
+	control := substratetest.NewControlServer()
+	env, acts := newEnv(t, control)
+
+	actor := activities.ActorRef{Atespace: "default", Name: "job"}
+	template := activities.TemplateRef{Atespace: "default", Name: "job-tmpl-0a1b2c3d"}
+	if _, err := env.ExecuteActivity(acts.EnsureActorTemplate, activities.TemplateInput{
+		Template: template,
+		Image:    "ghcr.io/example/agent",
+		Task:     testTask(),
+	}); err != nil {
+		t.Fatalf("EnsureActorTemplate failed: %v", err)
+	}
+	if _, err := env.ExecuteActivity(acts.EnsureActor, activities.ActorInput{Actor: actor, Template: template}); err != nil {
+		t.Fatalf("EnsureActor failed: %v", err)
+	}
+
+	_, err := env.ExecuteActivity(acts.DeleteActorTemplates, activities.TemplatesInput{
+		Atespace: "default", TaskName: "job",
+	})
+	var appErr *temporal.ApplicationError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected an application error, got %v", err)
+	}
+	if appErr.Type() != activities.ErrTypeSubstrate || appErr.NonRetryable() {
+		t.Errorf("expected a retryable %s, got %s (retryable=%v)",
+			activities.ErrTypeSubstrate, appErr.Type(), !appErr.NonRetryable())
+	}
+
+	// The same answer for one named template is retried too.
+	_, err = env.ExecuteActivity(acts.DeleteActorTemplateIfExists, template)
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected an application error, got %v", err)
+	}
+	if appErr.NonRetryable() {
+		t.Error("a template held by an actor has to be retried")
+	}
+
+	// Once the actor is gone the template follows.
+	if _, err := env.ExecuteActivity(acts.DeleteActorIfExists, actor); err != nil {
+		t.Fatalf("DeleteActorIfExists failed: %v", err)
+	}
+	if _, err := env.ExecuteActivity(acts.DeleteActorTemplates, activities.TemplatesInput{
+		Atespace: "default", TaskName: "job",
+	}); err != nil {
+		t.Fatalf("DeleteActorTemplates after the actor went failed: %v", err)
+	}
+	if got := control.DeletedTemplates(); len(got) != 1 || got[0] != template.Name {
+		t.Errorf("expected the template to be deleted, got %v", got)
+	}
+}
+
+// A failed precondition from anywhere else stays permanent.
+func TestFailedPreconditionIsPermanentElsewhere(t *testing.T) {
+	control := substratetest.NewControlServer()
+	control.CreateActorErr = status.Error(codes.FailedPrecondition, "atespace is being deleted")
+	env, acts := newEnv(t, control)
+
+	_, err := env.ExecuteActivity(acts.EnsureActor, activities.ActorInput{
+		Actor:    activities.ActorRef{Atespace: "default", Name: "job"},
+		Template: activities.TemplateRef{Atespace: "default", Name: "job-tmpl-0a1b2c3d"},
+	})
+	var appErr *temporal.ApplicationError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected an application error, got %v", err)
+	}
+	if appErr.Type() != activities.ErrTypePermanent || !appErr.NonRetryable() {
+		t.Errorf("expected a non-retryable %s, got %s (retryable=%v)",
+			activities.ErrTypePermanent, appErr.Type(), !appErr.NonRetryable())
+	}
+}

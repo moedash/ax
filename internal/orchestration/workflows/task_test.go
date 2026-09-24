@@ -62,10 +62,11 @@ type calls struct {
 	madeTemplates map[string]bool
 
 	// failures let a test make one step fail.
-	templateErr error
-	actorErr    error
-	policyErr   error
-	resumeErr   error
+	templateErr    error
+	actorErr       error
+	policyErr      error
+	resumeErr      error
+	deleteActorErr error
 	// workspaceReady is what the readiness poll reports, unless probeAnswers
 	// has an answer queued for this call.
 	workspaceReady bool
@@ -271,6 +272,9 @@ func (s *taskWorkflowSuite) mockActivities() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			c.delActors = append(c.delActors, in.Name)
+			if c.deleteActorErr != nil {
+				return c.deleteActorErr
+			}
 			c.actorExists = false
 			c.actorTemplate = ""
 			return nil
@@ -864,4 +868,48 @@ func (s *taskWorkflowSuite) TestContinueAsNewKeepsABufferedCompletion() {
 	s.Require().NotNil(next.Status.ExitCode)
 	s.Equal(int32(9), next.Status.GetExitCode())
 	s.Equal(v1alpha1.PhaseCompleted, next.Status.GetPhase())
+}
+
+// A task is only gone once its sandbox is. A teardown that cannot finish keeps
+// the task answerable, and a later delete tries again.
+func (s *taskWorkflowSuite) TestATeardownThatFailsKeepsTheTask() {
+	s.calls.deleteActorErr = temporal.NewNonRetryableApplicationError(
+		"actor is wedged", activities.ErrTypePermanent, nil)
+
+	var deleteErr error
+	var stillThere *v1alpha1.TaskStatus
+
+	s.env.RegisterDelayedCallback(func() {
+		s.env.UpdateWorkflow(workflows.UpdateDelete, "delete-1", &testsuite.TestUpdateCallback{
+			OnReject: func(err error) { s.Failf("delete rejected", "%v", err) },
+			OnAccept: func() {},
+			OnComplete: func(_ any, err error) {
+				deleteErr = err
+			},
+		})
+	}, time.Second)
+
+	s.env.RegisterDelayedCallback(func() {
+		stillThere = s.queryStatus()
+		// Whatever wedged the sandbox clears, and the task can go.
+		s.calls.mu.Lock()
+		s.calls.deleteActorErr = nil
+		s.calls.mu.Unlock()
+		s.env.UpdateWorkflowNoRejection(workflows.UpdateDelete, "delete-2", s.T())
+	}, 2*time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+
+	s.True(s.env.IsWorkflowCompleted())
+	s.NoError(s.env.GetWorkflowError(), "the second delete released the task")
+
+	s.Require().Error(deleteErr, "a delete that could not release the sandbox says so")
+	s.Contains(deleteErr.Error(), "still there")
+
+	s.Require().NotNil(stillThere)
+	s.Equal(v1alpha1.PhaseFailed, stillThere.GetPhase(), "the task stays, and says it could not go")
+	assertCondition(s.T(), stillThere, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TeardownFailed")
+
+	s.Len(s.calls.get(&s.calls.delActors), 2, "the delete was tried again")
+	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.delTmpl), "templates go once the actor has")
 }

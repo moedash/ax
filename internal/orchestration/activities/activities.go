@@ -225,7 +225,7 @@ func (a *Activities) DeleteActorTemplateIfExists(ctx context.Context, in Templat
 	stop := heartbeatUntilDone(ctx)
 	defer stop()
 
-	return classify(a.Substrate.DeleteActorTemplate(ctx, in.Atespace, in.Name))
+	return classifyTemplateDeletion(a.Substrate.DeleteActorTemplate(ctx, in.Atespace, in.Name))
 }
 
 // EnsureActor creates the task's actor from its template. A crashed actor is
@@ -372,9 +372,7 @@ func (a *Activities) DeleteActorTemplates(ctx context.Context, in TemplatesInput
 		}
 		logger.Info("deleting actor template", "atespace", in.Atespace, "template", name)
 		if err := a.Substrate.DeleteActorTemplate(ctx, in.Atespace, name); err != nil {
-			// Substrate rejects template deletion while an actor still references
-			// it, which resolves once the actor is gone. Let the retry policy wait.
-			return classify(err)
+			return classifyTemplateDeletion(err)
 		}
 	}
 	return nil
