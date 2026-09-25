@@ -33,7 +33,7 @@ state, so it resumes where it stopped.
 | `SaveTask` plus a stream event | `UpdateWithStartWorkflow` with the `apply` update |
 | `XREADGROUP` loop in `ax-controller` | Temporal worker polling the `ax-tasks` task queue |
 | Reconcile function | `TaskWorkflow`, one execution per task |
-| Five Substrate calls in a row | Five activities, each idempotent, with the four that create a sandbox rolled back by a saga |
+| Five Substrate calls in a row | A look at what is there, then four idempotent activities that build the sandbox, with what the pass itself created rolled back by a saga |
 | In-reconcile 15 second readiness poll | A heartbeating activity that polls in the background |
 | `GetTask` from Redis | `task` query on the workflow |
 | `ListTasks` from a Redis index | Visibility alone, over the attributes a task publishes about itself |
@@ -51,6 +51,7 @@ state, so it resumes where it stopped.
 | `internal/orchestration/taskclient` | The client the API server uses: updates, queries, visibility |
 | `internal/orchestration` | The `Tasks` interface the API server depends on, and the errors it maps to status codes |
 | `cmd/ax-controller` | Worker wiring: dependencies in, workflow and activities registered |
+| `cmd/ax-migrate-tasks` | One-shot import of the tasks an earlier control plane left in Redis |
 
 ## The lifecycle of a task
 
@@ -62,10 +63,14 @@ state, so it resumes where it stopped.
    `WorkflowIDReusePolicy: ALLOW_DUPLICATE` lets a task be created again under
    the same name once its workflow has ended, which is the normal case after a
    delete.
-2. **Provision.** The workflow runs, in order: `EnsureAtespace`,
-   `EnsureActorTemplate`, `EnsureActor`, `ApplyEgressPolicy`. Each compensation
-   is registered before the step it undoes, and only undoes what the pass
-   itself created.
+2. **Provision.** The workflow looks first: `ObserveActor` says whether the
+   task has an actor and which template it is on, `ObserveActorTemplate`
+   whether the template this pass would build is already there. Then it runs,
+   in order: `EnsureAtespace`, `EnsureActorTemplate`, `EnsureActor`,
+   `ApplyEgressPolicy`. Each compensation is registered before the step it
+   undoes, and only undoes what the observation said was not there before the
+   pass. An actor found on some other template is deleted and created again
+   on this one.
 3. **Activate.** `SuspendActor` or `ResumeActor`, depending on `spec.suspend`.
    The resume answers with the worker's address, which becomes
    `status.workerIP`.
@@ -90,6 +95,14 @@ changed spec therefore deletes the actor and creates it again on the new
 template, and the workflow confirms which template the actor ended up on before
 recording the spec as provisioned.
 
+Each sandbox a task has had is a **generation**, counted in the workflow. The
+generation is part of the template name and is handed to the runner as
+`AX_SANDBOX_GENERATION`, so a completion report says which sandbox it is about.
+A report from a generation the task has replaced is refused: it says how the
+old sandbox's command ended, not how the new one is doing. Replacing the
+sandbox also clears `status.exitCode` and the `Completed` phase, because the
+replacement has not run its command yet.
+
 **Whatever the old sandbox had in its workspace is discarded with it.** A task
 that has been working in `/workspace` loses that work, and its `WorkspaceReady`
 condition goes back to False while the replacement sets itself up. Suspending
@@ -102,7 +115,7 @@ and resuming are not spec changes and leave the sandbox alone.
 | Update | `apply` | The task plus the resolved gateway and workspaces | The task, once the sandbox is in the state the spec asks for |
 | Update | `suspend` | none | The task |
 | Update | `resume` | none | The task |
-| Update | `complete` | Exit code and an optional message | The task status |
+| Update | `complete` | Exit code, an optional message, and the sandbox generation | The task status |
 | Update | `delete` | none | Nothing, once the record is gone |
 | Signal | `complete` | Same as the update | Nothing |
 | Query | `task` | none | Metadata, spec, and status |
@@ -121,13 +134,21 @@ rejection is answered as `NotFound` whatever the run closed as. `ListTasks`
 only asks visibility about running ones.
 
 Every update has a validator, and every validator only reads state: it rejects a
-change to a task that is being deleted, and a spec that cannot be applied, before
-the request is written to history.
+change to a task that is being deleted, a change before the first apply has
+landed, a spec that cannot be applied or that names another task, and a
+completion report from a replaced sandbox, before the request is written to
+history.
 
 The `complete` signal exists for one reason: the runner is PID 1 of the sandbox
 and may be shutting down when the command exits. An update needs a worker to
 accept it; a signal only needs the service. The runner tries the update first,
-because it wants to know the report landed, and falls back to the signal.
+because it wants to know the report landed, and falls back to the signal. The
+two have separate deadlines, five seconds each: with no worker polling, the
+update waits out its whole deadline, and a signal sent under the same one
+would fail at once. A signal has no validator, so the workflow drops a report
+from a replaced sandbox on that path as well. The runner does not report an
+exit it caused itself by stopping the command: a suspend or a stop of the
+sandbox is not the task finishing its work.
 
 ## Timeouts and retry policies
 
@@ -175,12 +196,23 @@ every call the API server makes has a bounded wait:
 | `UpdateTask` | The `apply` update to complete, up to 10 seconds | The task was created; it is reported `Pending` |
 | `SuspendTask`, `ResumeTask`, `DeleteTask` | The update to be accepted, up to 10 seconds | `Unavailable`, with the task named |
 | `GetTask` | The `task` query, up to 5 seconds | `Unavailable` |
-| `ListTasks` | Visibility, then one query per task, up to 5 seconds each | The task is listed with what visibility knows and no status |
+| `ListTasks` | Visibility alone | Not applicable: no worker is involved |
+| `WatchTask` | The `task` query on each poll | `Unavailable` after fifteen unanswered polls in a row, so a controller restart does not end a watch |
 
 This is the one place where the new design is less forgiving than the old one.
 Writing a task to Redis succeeded whether or not a controller was alive to act
 on it, and the task then sat there untouched. Now a control plane with no
 workers says so.
+
+`ListTasks` reads visibility, which is updated after the workflow's own state
+by the visibility store's indexing delay, so a listing right after an apply can
+miss the task or show a phase `GetTask` has already moved past. `GetTask`,
+`SuspendTask`, `ResumeTask`, and `UpdateTask` read the workflow itself and see
+their own writes.
+
+A delete interrupts a provisioning pass that is still retrying, so `ax delete`
+does not wait out the fifteen minute budget of a pass that is not going to
+succeed.
 
 ## Idempotency
 
@@ -191,17 +223,24 @@ resources:
 - The **actor** carries the task's name. That is also why a task and its actor
   are interchangeable in the router's `ate-target-actor` header.
 - The **actor template** is named `<task>-tmpl-<digest>`, where the digest covers
-  the task spec and every workspace it binds. The same spec always maps to the
-  same template, and a spec change makes a new one.
+  the task spec, every workspace it binds, and the sandbox generation. The same
+  spec for the same generation always maps to the same template; a spec change
+  or a replacement sandbox makes a new one. The suffix takes fourteen characters
+  of the sixty-three a Substrate name may have, which is why a task name is
+  capped at forty-nine.
 - The digest deliberately excludes the task's status and its `suspend` flag.
   Both change while a task runs and neither changes what the sandbox is made of,
   so including them stranded a new template on every status update and every
   suspend.
 - Resolved credentials are excluded as well. The model API key is looked up
   inside the activity that builds the template, so no secret is written to
-  workflow history. The consequence is worth knowing: rotating the key does not
-  by itself produce a new template, so a sandbox keeps the key it was built with
-  until some other spec change replaces the template.
+  workflow history. The consequence: rotating the key does not by itself produce
+  a new template, so a sandbox keeps the key it was built with until some other
+  spec change replaces the template.
+- The report flag and the Temporal coordinates are excluded for the same
+  reason: they are worker settings, not part of the spec. Toggling
+  `--sandbox-report-completion` or changing `--sandbox-temporal-address` reaches
+  an existing sandbox only on its next spec change.
 
 ## Compensations
 
@@ -213,19 +252,27 @@ the workflow itself is being cancelled:
 | Step | Compensation |
 |---|---|
 | `EnsureAtespace` | none. The atespace is shared by every task in it. |
-| `EnsureActorTemplate` | `DeleteActorTemplates` |
-| `EnsureActor` | `DeleteActorIfExists` |
-| `ApplyEgressPolicy` | `DeleteEgressPolicyIfExists` |
+| `EnsureActorTemplate` | `DeleteActorTemplateIfExists`, when the template was not there before the pass |
+| `EnsureActor` | `DeleteActorIfExists`, when the actor was not there before the pass, or the pass replaced it |
+| `ApplyEgressPolicy` | `DeleteEgressPolicyIfExists`, under the same condition as the actor |
+
+Whether a resource "was there before" is settled by the observation at the
+start of the pass, not by what the create call answers. Activities run at
+least once: a worker that dies after Substrate created the template but before
+the result was recorded gets "found" on the retry, and a rollback that trusted
+that answer would leave the template behind.
 
 Activation is retried but never compensated. Deleting a sandbox because a resume
 failed would throw away the workspace the task has been building, so a task that
 cannot be activated stays `Failed` with its sandbox intact and can be resumed
 again later.
 
-A task bound to a gateway is rolled back when its egress policy cannot be
-applied: it must not run without the allowlist it was given. A task with no
-gateway keeps unrestricted egress either way, so there a failure is reported on
-the `GatewayReady` condition and the task runs.
+A task bound to a gateway must not run without the allowlist it was given. When
+its egress policy cannot be applied, a sandbox the pass created is rolled back,
+and a sandbox the pass found running is suspended: the workspace is kept, and
+nothing runs in it until an apply with a policy Substrate accepts resumes it.
+A task with no gateway keeps unrestricted egress either way, so there a failure
+is reported on the `GatewayReady` condition and the task runs.
 
 ## Trust boundary
 
@@ -238,17 +285,25 @@ nothing else. It has no address for Temporal and no workflow ID, so the runner
 logs how the command finished and the task stays `Running` until something else
 moves it.
 
-With the flag on, three variables are injected: `AX_WORKFLOW_ID`,
-`AX_TEMPORAL_ADDRESS`, and `AX_TEMPORAL_NAMESPACE`. What that buys is the
-`Completed` phase and `status.exitCode`. What it costs is a route out of the
-sandbox:
+With the flag on, four variables are injected: `AX_WORKFLOW_ID`,
+`AX_TEMPORAL_ADDRESS`, `AX_TEMPORAL_NAMESPACE`, and `AX_SANDBOX_GENERATION`.
+What that buys is the `Completed` phase and `status.exitCode`. What it costs is
+a route out of the sandbox:
 
 - Anything in the container can reach the Temporal frontend at that address.
 - It can send updates and signals to **any workflow it can name**, not only its
   own. Workflow IDs are `<atespace>/<name>`, which are easy to guess.
+- On a frontend that accepts unauthenticated callers it can do everything else
+  a client can: query any task, which returns the spec including `env` and
+  whatever secrets a task put there; list every workflow in the namespace; start
+  workflows of its own; and terminate any of them, which skips the task's
+  teardown and leaves the actor running.
+- The generation is a label, not a credential. It stops a stale report from
+  being taken for a current one; it does not stop a sandbox from sending a
+  report with the generation of another task's sandbox.
 - **No credential is injected.** On a frontend that requires mTLS or an API key
-  the report simply fails and is logged, so the flag is only useful where the
-  frontend accepts unauthenticated callers from the sandbox network.
+  the report fails and is logged, so the flag is only useful where the frontend
+  accepts unauthenticated callers from the sandbox network.
 - It is therefore only as safe as that frontend's authentication and network
   reachability. Leave it off when task code is not trusted, or keep the
   frontend unreachable from sandbox networks.
@@ -287,11 +342,16 @@ Two tests guard determinism:
   go build -o "$(go env GOPATH)/bin/workflowcheck-go1.27" .
   workflowcheck-go1.27 -test=false ./internal/orchestration/...
   ```
-- A replay test over a recorded history of a task's whole life, in
-  `internal/orchestration/workflows/testdata`. Re-record it with a dev server:
+- Replay tests over two recorded histories in
+  `internal/orchestration/workflows/testdata`: a task's whole life, from apply
+  through suspend, resume, a reported exit, and delete; and a task that sits
+  through resync cycles until the service suggests continuing as new. Re-record
+  both with a dev server. The suggestion threshold is lowered so the second
+  recording reaches it in seconds rather than days:
 
   ```bash
-  temporal server start-dev --port 7466 --ui-port 8466 --headless
+  temporal server start-dev --port 7466 --ui-port 8466 --headless \
+    --dynamic-config-value limit.historyCount.suggestContinueAsNew=150
   AX_RECORD_HISTORY_ADDRESS=localhost:7466 \
     go test ./internal/orchestration/workflows/ -run TestRecordHistory
   ```
@@ -331,10 +391,11 @@ actor instead of asking, is the follow-up that removes the tradeoff.
 
 A task's workflow lives as long as the task, which for an agent can be days. The
 workflow continues as new when the service suggests it, after draining anything
-left in the completion channel, and carries the desired state and the status
-across. The next run re-drives the provisioning sequence, which is idempotent and
-cheap, and skips the workspace poll because `WorkspaceReady` came across with the
-status.
+left in the completion channel, and carries the desired state, the status, the
+sandbox generation, and a teardown failure across. The next run re-drives the
+provisioning sequence, which is idempotent and cheap: the observation finds the
+actor on the template of the carried generation, so nothing is replaced. The
+workspace poll is skipped because `WorkspaceReady` came across with the status.
 
 ## Running it locally
 
@@ -374,6 +435,19 @@ whole history, and its pending updates.
 
 ## What changed for operators
 
+- **Delete every task before the upgrade.** This is a requirement, not advice.
+  Task records in Redis are not read by anything after this change: `ax get
+  tasks` lists none of them, `ax delete` answers `NotFound` for each, and their
+  actors keep running on Substrate with nothing pointing at them. `ax get tasks`
+  on the old control plane, then `ax delete task` for each, is the whole
+  procedure. For a cluster that was upgraded with tasks still in it, run
+  `ax-migrate-tasks` once, after the new `ax-server` is up: it reads the old
+  Redis task index, applies each task through the API server, and removes the
+  task's Redis keys once the server has it. The import brings each task back
+  under management but does not keep its sandbox: the old actor is bound to
+  the template the old controller built it from, so the task's workflow
+  replaces it, and whatever was in its workspace goes with it. The tool is
+  idempotent and names the tasks it could not import, so it can be run again.
 - **`ax-controller` no longer talks to Redis.** It takes `--temporal-address`,
   `--temporal-namespace`, and `--task-queue`. The `--redis-*` flags are gone.
   `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, and `AX_TASK_QUEUE` override them.
@@ -386,9 +460,15 @@ whole history, and its pending updates.
 - **Redis stays, for gateways, workspaces, and models.** It is no longer on the
   path of a running task, so losing it does not stop tasks from being provisioned
   or torn down.
-- **The search attributes must exist** in the namespace before a worker starts,
-  or starting a task fails: `AxAtespace`, `AxPhase` and `AxGateway` as Keyword,
-  `AxWorkspaces` as KeywordList.
+- **The search attributes must exist** in the namespace: `AxAtespace`, `AxPhase`
+  and `AxGateway` as Keyword, `AxWorkspaces` as KeywordList. Both `ax-controller`
+  and `ax-server` check for them at startup and refuse to start without them,
+  printing the `temporal operator search-attribute create` command that
+  registers them. The check is there because a missing attribute would
+  otherwise fail every task's workflow task without ever saying why.
+- **A task name is at most 49 characters.** Its actor template is named after
+  it with a fourteen character suffix, and Substrate names are DNS labels of at
+  most 63. Other kinds keep the 63 character limit.
 - **A listing no longer asks each task.** `ax get tasks` reads name, atespace,
   phase and age from visibility, which is one call however many tasks there
   are. The worker address is not carried there, so it shows only in
@@ -404,6 +484,13 @@ whole history, and its pending updates.
   'TaskWorkflow'"` lists them, `temporal workflow show -w <atespace>/<name>`
   shows everything that has happened to one, and a task stuck in `Pending` shows
   exactly which activity is failing and why.
+- **To remove a task from the Temporal side, cancel its workflow, never
+  terminate it.** `temporal workflow cancel -w <atespace>/<name>` runs the same
+  teardown a delete does, through a disconnected context, and the sandbox goes
+  with the task. `temporal workflow terminate` ends the run without running any
+  workflow code, so the actor and its templates stay on Substrate with nothing
+  pointing at them, and `ax get task` answers `NotFound` as if the task were
+  gone. `ax delete` is still the tool for normal use.
 - **With no worker running, task calls report `Unavailable`.** Reading or
   changing a task needs a worker to answer for it. A listing still works, and
   shows the tasks that exist with no status.

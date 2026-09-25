@@ -54,7 +54,8 @@ type Tasks interface {
 	// Get returns one task, or ErrTaskNotFound.
 	Get(ctx context.Context, atespace, name string) (*v1alpha1.Task, error)
 	// List returns the tasks of an atespace, or of every atespace when it is
-	// empty. Tasks whose sandbox is being torn down are left out.
+	// empty, as visibility knows them. A task whose sandbox is being torn down
+	// is listed with the Terminating phase until it is gone.
 	List(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error)
 	// Suspend checkpoints a task's sandbox and stops it.
 	Suspend(ctx context.Context, atespace, name string) (*v1alpha1.Task, error)

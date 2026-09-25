@@ -392,7 +392,7 @@ func atespaceOf(atespace string) string {
 
 // mapError turns what Temporal reports into the errors the API server answers
 // with. A task that has no workflow, and a task whose workflow has torn its
-// sandbox down, are both simply gone.
+// sandbox down, are both gone.
 func mapError(err error) error {
 	if err == nil {
 		return nil

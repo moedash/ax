@@ -37,15 +37,16 @@ all: build
 ## Build Targets
 ## --------------------------------------
 
-# Build all local binaries (ax CLI, Temporal worker, API server)
+# Build all local binaries (ax CLI, Temporal worker, API server, task import)
 build: build-binaries
 
 build-binaries:
-	@echo "==> Building local binaries (ax, ax-controller, ax-server)..."
+	@echo "==> Building local binaries (ax, ax-controller, ax-server, ax-migrate-tasks)..."
 	@mkdir -p bin
 	go build -trimpath -ldflags="-s -w" -o bin/ax ./cmd/ax
 	go build -trimpath -ldflags="-s -w" -o bin/ax-controller ./cmd/ax-controller
 	go build -trimpath -ldflags="-s -w" -o bin/ax-server ./cmd/ax-server
+	go build -trimpath -ldflags="-s -w" -o bin/ax-migrate-tasks ./cmd/ax-migrate-tasks
 
 # Install the ax CLI into $(go env GOPATH)/bin
 install:
