@@ -70,6 +70,9 @@ const (
 	ErrTypeTeardownFailed = "TeardownFailed"
 	// ErrTypeInvalidTask rejects an update whose task spec cannot be applied.
 	ErrTypeInvalidTask = "InvalidTask"
+	// ErrTypeStaleReport rejects a completion report from a sandbox the task
+	// has since replaced.
+	ErrTypeStaleReport = "StaleReport"
 )
 
 // Search attributes carry enough of a task in visibility to list tasks, and to
@@ -126,6 +129,10 @@ type TaskWorkflowInput struct {
 	// Status carries the task's status across a continue-as-new boundary. It is
 	// empty when a task is first created.
 	Status *v1alpha1.TaskStatus
+	// Generation is the sandbox generation the task is on, carried across a
+	// continue-as-new boundary so the next run names the same template and
+	// accepts reports from the same sandbox.
+	Generation int
 }
 
 // CompleteInput reports how the task command finished.
@@ -135,4 +142,8 @@ type CompleteInput struct {
 	// Message is an optional note from the runner, such as why the command was
 	// stopped.
 	Message string
+	// Generation is the sandbox generation the report comes from, read from the
+	// container's environment. A report from a generation the task has replaced
+	// is dropped: it says how the old sandbox's command ended, not this one's.
+	Generation int
 }

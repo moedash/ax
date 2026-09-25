@@ -54,9 +54,10 @@ type calls struct {
 	templateIn []activities.TemplateInput
 
 	// actorExists and actorTemplate stand in for Substrate binding an actor to
-	// the template it was created from.
+	// the template it was created from, and actorState for what it is doing.
 	actorExists   bool
 	actorTemplate string
+	actorState    string
 	// madeTemplates records which templates this fake has created, so a second
 	// pass over the same spec reports finding one rather than making it.
 	madeTemplates map[string]bool
@@ -71,8 +72,9 @@ type calls struct {
 	// has an answer queued for this call.
 	workspaceReady bool
 	probeAnswers   []bool
-	// observation is what a resync sees.
-	observation activities.ActorObservation
+	// observation, when set, is what an observe sees in place of the fake's own
+	// record of the actor. It only applies while the fake has an actor.
+	observation *activities.ActorObservation
 
 	// gates hold an activity open so a test can land an update in the middle of
 	// a provisioning pass.
@@ -206,11 +208,12 @@ func (s *taskWorkflowSuite) mockActivities() {
 				// Substrate keeps an actor on the template it was created from.
 				return activities.ActorProvision{
 					Template: activities.TemplateRef{Atespace: in.Actor.Atespace, Name: c.actorTemplate},
-					State:    activities.ActorStateRunning,
+					State:    c.actorState,
 				}, nil
 			}
 			c.actorExists = true
 			c.actorTemplate = in.Template.Name
+			c.actorState = activities.ActorStateSuspended
 			return activities.ActorProvision{
 				Created:  true,
 				Template: in.Template,
@@ -228,19 +231,30 @@ func (s *taskWorkflowSuite) mockActivities() {
 
 	s.env.OnActivity(a.SuspendActor, mock.Anything, mock.Anything).Return(
 		func(ctx context.Context, in activities.ActorRef) error {
-			c.add(&c.suspends, in.Name)
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.suspends = append(c.suspends, in.Name)
+			c.actorState = activities.ActorStateSuspended
 			return nil
 		}).Maybe()
 
 	s.env.OnActivity(a.ResumeActor, mock.Anything, mock.Anything).Return(
 		func(ctx context.Context, in activities.ActorRef) (string, error) {
-			c.add(&c.resumes, in.Name)
 			c.mu.Lock()
 			defer c.mu.Unlock()
+			c.resumes = append(c.resumes, in.Name)
 			if c.resumeErr != nil {
 				return "", c.resumeErr
 			}
+			c.actorState = activities.ActorStateRunning
 			return "10.244.1.42", nil
+		}).Maybe()
+
+	s.env.OnActivity(a.ObserveActorTemplate, mock.Anything, mock.Anything).Return(
+		func(ctx context.Context, in activities.TemplateRef) (activities.TemplateObservation, error) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			return activities.TemplateObservation{Exists: c.madeTemplates[in.Name]}, nil
 		}).Maybe()
 
 	s.env.OnActivity(a.AwaitWorkspaceReady, mock.Anything, mock.Anything).Return(
@@ -261,10 +275,21 @@ func (s *taskWorkflowSuite) mockActivities() {
 
 	s.env.OnActivity(a.ObserveActor, mock.Anything, mock.Anything).Return(
 		func(ctx context.Context, in activities.ActorRef) (activities.ActorObservation, error) {
-			c.add(&c.observes, in.Name)
 			c.mu.Lock()
 			defer c.mu.Unlock()
-			return c.observation, nil
+			c.observes = append(c.observes, in.Name)
+			if !c.actorExists {
+				return activities.ActorObservation{}, nil
+			}
+			observed := activities.ActorObservation{Exists: true, State: c.actorState}
+			if c.actorState == activities.ActorStateRunning {
+				observed.WorkerIP = "10.244.1.42"
+			}
+			if c.observation != nil {
+				observed = *c.observation
+			}
+			observed.Template = activities.TemplateRef{Atespace: in.Atespace, Name: c.actorTemplate}
+			return observed, nil
 		}).Maybe()
 
 	s.env.OnActivity(a.DeleteActorIfExists, mock.Anything, mock.Anything).Return(
@@ -277,6 +302,7 @@ func (s *taskWorkflowSuite) mockActivities() {
 			}
 			c.actorExists = false
 			c.actorTemplate = ""
+			c.actorState = ""
 			return nil
 		}).Maybe()
 
@@ -398,9 +424,10 @@ func (s *taskWorkflowSuite) TestTemplateNameIsDerivedFromTheSpec() {
 
 	got, ok := s.calls.lastTemplateInput()
 	s.Require().True(ok)
-	s.Equal(activities.TaskTemplateName(in.Desired.Task, in.Desired.Workspaces), got.Template.Name)
+	s.Equal(activities.TaskTemplateName(in.Desired.Task, in.Desired.Workspaces, 0), got.Template.Name)
 	s.Equal("default", got.Template.Atespace)
 	s.Equal("default/test-task", got.WorkflowID)
+	s.Equal(0, got.Generation)
 }
 
 func (s *taskWorkflowSuite) TestActorFailureRollsBackProvisioning() {
@@ -418,7 +445,10 @@ func (s *taskWorkflowSuite) TestActorFailureRollsBackProvisioning() {
 
 	s.NotEmpty(s.calls.get(&s.calls.actors))
 	s.Empty(s.calls.get(&s.calls.resumes), "a task that failed to provision is never resumed")
-	s.Contains(s.calls.get(&s.calls.delTmpl), "test-task", "the actor template is rolled back")
+	s.Contains(s.calls.get(&s.calls.delTmplOne),
+		activities.TaskTemplateName(testInput().Desired.Task, testInput().Desired.Workspaces, 0),
+		"the template the pass created is rolled back")
+	s.Contains(s.calls.get(&s.calls.delTmpl), "test-task", "the teardown removes what is left")
 
 	s.Require().NotNil(failed)
 	s.Equal(v1alpha1.PhaseFailed, failed.GetStatus().GetPhase())
@@ -594,7 +624,7 @@ func (s *taskWorkflowSuite) TestCancellationReleasesTheSandbox() {
 // A resync notices a sandbox that crashed behind the workflow's back and builds
 // a new one.
 func (s *taskWorkflowSuite) TestResyncReplacesACrashedSandbox() {
-	s.calls.observation = activities.ActorObservation{
+	s.calls.observation = &activities.ActorObservation{
 		Exists: true,
 		State:  activities.ActorStateCrashed,
 	}
@@ -614,10 +644,12 @@ func (s *taskWorkflowSuite) TestResyncReplacesACrashedSandbox() {
 	s.Equal(v1alpha1.PhaseRunning, replaced.GetPhase())
 }
 
-// A task carries its status across a continue-as-new boundary, so a long-lived
-// task does not provision itself from scratch again.
+// A task carries its status and its sandbox generation across a continue-as-new
+// boundary, so a long-lived task does not provision itself from scratch again
+// and does not take its own sandbox for one that has to be replaced.
 func (s *taskWorkflowSuite) TestContinuedRunKeepsTheSandbox() {
 	in := testInput()
+	in.Generation = 2
 	in.Status = &v1alpha1.TaskStatus{
 		Phase:    v1alpha1.PhaseRunning,
 		Actor:    "test-task",
@@ -629,6 +661,13 @@ func (s *taskWorkflowSuite) TestContinuedRunKeepsTheSandbox() {
 			Reason: "SetupComplete",
 		}},
 	}
+	// The sandbox the previous run built is there, on the template of its
+	// generation.
+	template := activities.TaskTemplateName(in.Desired.Task, in.Desired.Workspaces, 2)
+	s.calls.actorExists = true
+	s.calls.actorTemplate = template
+	s.calls.actorState = activities.ActorStateRunning
+	s.calls.madeTemplates[template] = true
 
 	var status *v1alpha1.TaskStatus
 	s.env.RegisterDelayedCallback(func() {
@@ -640,8 +679,11 @@ func (s *taskWorkflowSuite) TestContinuedRunKeepsTheSandbox() {
 	s.Require().NoError(s.env.GetWorkflowError())
 
 	// Provisioning runs again because it is idempotent, but the workspace is not
-	// probed a second time and the task keeps its identity.
+	// probed a second time, the sandbox is not replaced, and the task keeps its
+	// identity.
 	s.Empty(s.calls.get(&s.calls.probes))
+	s.Len(s.calls.get(&s.calls.delActors), 1, "only the teardown deletes the actor")
+	s.Equal([]string{template}, s.calls.get(&s.calls.templates))
 	s.Require().NotNil(status)
 	s.Equal("task-test-task-1", status.GetId())
 	s.Equal(v1alpha1.PhaseRunning, status.GetPhase())
@@ -682,7 +724,7 @@ func assertCondition(t *testing.T, status *v1alpha1.TaskStatus, condType, wantSt
 // looks again.
 func (s *taskWorkflowSuite) TestResyncRechecksAWorkspaceThatWasStillInitializing() {
 	s.calls.workspaceReady = false
-	s.calls.observation = activities.ActorObservation{
+	s.calls.observation = &activities.ActorObservation{
 		Exists:   true,
 		State:    activities.ActorStateRunning,
 		WorkerIP: "10.244.1.42",
@@ -732,8 +774,9 @@ func (s *taskWorkflowSuite) TestApplyReplacesTheSandboxForANewSpec() {
 	templates := s.calls.get(&s.calls.templates)
 	s.Require().GreaterOrEqual(len(templates), 2)
 	s.NotEqual(templates[0], templates[len(templates)-1], "a new image is a new template")
+	// The replacement is the task's second sandbox, and its template says so.
 	s.Equal(
-		activities.TaskTemplateName(changed.Desired.Task, changed.Desired.Workspaces),
+		activities.TaskTemplateName(changed.Desired.Task, changed.Desired.Workspaces, 1),
 		templates[len(templates)-1],
 	)
 	// One delete to replace the sandbox, one to tear the task down.
@@ -745,12 +788,16 @@ func (s *taskWorkflowSuite) TestApplyReplacesTheSandboxForANewSpec() {
 	s.Equal(v1alpha1.PhaseRunning, replaced.GetStatus().GetPhase())
 }
 
-// A pass that finds a sandbox it did not create must not roll it back.
-func (s *taskWorkflowSuite) TestReprovisionLeavesASandboxItDidNotCreate() {
+// A pass that finds a sandbox it did not create and cannot restrict stops it.
+// Deleting it would throw away the workspace; leaving it running would let the
+// task run without the allowlist it was given.
+func (s *taskWorkflowSuite) TestReprovisionStopsASandboxItCannotRestrict() {
 	// A different gateway changes what has to be applied to the sandbox, not
 	// what the sandbox is made of, so the actor and its template stay.
 	changed := testInput()
-	changed.Desired.Gateway.Spec.Egress.Allowlist.Hosts = []*v1alpha1.HostRule{{Host: "example.com", Port: 443}}
+	changed.Desired.Gateway.Spec.Egress.Allowlist.Hosts = []*v1alpha1.HostRule{
+		{Host: "example.com", Port: 443},
+	}
 
 	s.env.RegisterDelayedCallback(func() {
 		s.calls.mu.Lock()
@@ -767,9 +814,32 @@ func (s *taskWorkflowSuite) TestReprovisionLeavesASandboxItDidNotCreate() {
 
 	s.Require().NotNil(failed)
 	s.Equal(v1alpha1.PhaseFailed, failed.GetStatus().GetPhase())
+	assertCondition(s.T(), failed.GetStatus(),
+		v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "PolicyApplyFailed")
+	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.suspends),
+		"the sandbox is stopped rather than left running without its allowlist")
 	s.Len(s.calls.get(&s.calls.delActors), 1, "only the teardown deletes the actor")
 	s.Empty(s.calls.get(&s.calls.delTmplOne), "a template the pass found is left alone")
 	s.Empty(s.calls.get(&s.calls.delPolicy), "the policy of a sandbox the pass found is left alone")
+}
+
+// What a rollback may delete is settled by looking before the pass creates
+// anything, not by what the create calls answer: a retried create finds what
+// its first attempt made and answers "found".
+func (s *taskWorkflowSuite) TestRollbackLeavesATemplateThatWasThereBeforeThePass() {
+	in := testInput()
+	template := activities.TaskTemplateName(in.Desired.Task, in.Desired.Workspaces, 0)
+	s.calls.madeTemplates[template] = true
+	s.calls.actorErr = temporal.NewNonRetryableApplicationError(
+		"template does not exist", activities.ErrTypePermanent, nil)
+
+	s.delete(time.Second)
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, in)
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.Equal([]string{template}, s.calls.get(&s.calls.templates))
+	s.Empty(s.calls.get(&s.calls.delTmplOne), "a template that was there before is not rolled back")
+	s.NotEmpty(s.calls.get(&s.calls.delActors), "the actor the pass tried to make is")
 }
 
 // A spec that arrives while a pass is running belongs to the next pass, not to
@@ -793,7 +863,7 @@ func (s *taskWorkflowSuite) TestApplyDuringProvisioningIsNotHalfApplied() {
 	s.Require().True(ok)
 	s.Equal("ghcr.io/example/agent:v2", last.Image, "the new spec is built by a pass of its own")
 	s.Equal(
-		activities.TaskTemplateName(changed.Desired.Task, changed.Desired.Workspaces),
+		activities.TaskTemplateName(changed.Desired.Task, changed.Desired.Workspaces, 1),
 		last.Template.Name,
 	)
 	s.Require().NotNil(applied)
@@ -929,6 +999,71 @@ func (s *taskWorkflowSuite) TestAStartWithNoSpecWaitsForTheApply() {
 	s.Equal("test-task", applied.GetMetadata().GetName())
 	s.Equal(v1alpha1.PhaseRunning, applied.GetStatus().GetPhase())
 	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.actors))
+}
+
+// A completion report names the sandbox it comes from. One from a sandbox the
+// task has since replaced says how that sandbox's command ended, not how the
+// current one is doing, and is refused on both paths it can arrive by.
+func (s *taskWorkflowSuite) TestACompletionFromAReplacedSandboxIsRefused() {
+	changed := testInput()
+	changed.Desired.Task.Spec.Image = "ghcr.io/example/agent:v2"
+
+	var replaced *v1alpha1.Task
+	s.updateTask(time.Second, workflows.UpdateApply, "apply-1", &replaced, changed.Desired)
+
+	rejected := false
+	s.env.RegisterDelayedCallback(func() {
+		stale := workflows.CompleteInput{ExitCode: -1, Message: "stopped", Generation: 0}
+		s.env.UpdateWorkflow(workflows.UpdateComplete, "complete-stale", &testsuite.TestUpdateCallback{
+			OnReject:   func(error) { rejected = true },
+			OnAccept:   func() {},
+			OnComplete: func(any, error) {},
+		}, stale)
+		// The signal path has no validator, so the same report is dropped there.
+		s.env.SignalWorkflow(workflows.SignalComplete, stale)
+	}, 2*time.Second)
+	var afterStale *v1alpha1.TaskStatus
+	s.env.RegisterDelayedCallback(func() { afterStale = s.queryStatus() }, 3*time.Second)
+
+	var completed *v1alpha1.TaskStatus
+	s.updateStatus(4*time.Second, workflows.UpdateComplete, "complete-1", &completed,
+		workflows.CompleteInput{ExitCode: 0, Generation: 1})
+	s.delete(5 * time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.True(rejected, "a report from the replaced sandbox is refused")
+	s.Require().NotNil(afterStale)
+	s.Equal(v1alpha1.PhaseRunning, afterStale.GetPhase())
+	s.Nil(afterStale.ExitCode)
+
+	s.Require().NotNil(completed, "a report from the current sandbox is taken")
+	s.Equal(v1alpha1.PhaseCompleted, completed.GetPhase())
+	s.Equal(int32(0), completed.GetExitCode())
+}
+
+// A replacement sandbox has not run its command yet, so how the old one's
+// command ended does not carry over to it.
+func (s *taskWorkflowSuite) TestReplacingTheSandboxResetsCompletion() {
+	var completed *v1alpha1.TaskStatus
+	s.updateStatus(time.Second, workflows.UpdateComplete, "complete-1", &completed,
+		workflows.CompleteInput{ExitCode: 3})
+
+	changed := testInput()
+	changed.Desired.Task.Spec.Image = "ghcr.io/example/agent:v2"
+	var replaced *v1alpha1.Task
+	s.updateTask(2*time.Second, workflows.UpdateApply, "apply-1", &replaced, changed.Desired)
+	s.delete(3 * time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.Require().NotNil(completed)
+	s.Equal(v1alpha1.PhaseCompleted, completed.GetPhase())
+	s.Require().NotNil(replaced)
+	s.Equal(v1alpha1.PhaseRunning, replaced.GetStatus().GetPhase())
+	s.Nil(replaced.GetStatus().ExitCode)
 }
 
 // A start that is never followed by its update does not sit there forever.

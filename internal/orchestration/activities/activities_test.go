@@ -80,7 +80,7 @@ func TestProvisioningSequence(t *testing.T) {
 	task := testTask()
 	template := activities.TemplateRef{
 		Atespace: "default",
-		Name:     activities.TaskTemplateName(task, nil),
+		Name:     activities.TaskTemplateName(task, nil, 0),
 	}
 	value, err := env.ExecuteActivity(acts.EnsureActorTemplate, activities.TemplateInput{
 		Template:   template,
@@ -187,7 +187,7 @@ func TestActorTemplateCarriesTheRunnerEnvironment(t *testing.T) {
 			Git: []*v1alpha1.GitRepo{{Name: "repo", Repo: "https://github.com/example/repo"}},
 		},
 	}}
-	name := activities.TaskTemplateName(task, workspaces)
+	name := activities.TaskTemplateName(task, workspaces, 0)
 
 	if _, err := env.ExecuteActivity(acts.EnsureActorTemplate, activities.TemplateInput{
 		Template:   activities.TemplateRef{Atespace: "default", Name: name},
@@ -195,6 +195,7 @@ func TestActorTemplateCarriesTheRunnerEnvironment(t *testing.T) {
 		Task:       task,
 		Workspaces: workspaces,
 		WorkflowID: "default/job",
+		Generation: 3,
 	}); err != nil {
 		t.Fatalf("EnsureActorTemplate failed: %v", err)
 	}
@@ -211,6 +212,9 @@ func TestActorTemplateCarriesTheRunnerEnvironment(t *testing.T) {
 	}
 	if got := templateEnv[v1alpha1.EnvTemporalAddress]; got == "" {
 		t.Error("expected the Temporal address in the container env")
+	}
+	if got := templateEnv[v1alpha1.EnvSandboxGeneration]; got != "3" {
+		t.Errorf("expected the sandbox generation in the container env, got %q", got)
 	}
 	taskYAML := templateEnv[v1alpha1.EnvTaskYAML]
 	if !strings.Contains(taskYAML, "name: job") {
@@ -229,31 +233,36 @@ func TestActorTemplateCarriesTheRunnerEnvironment(t *testing.T) {
 // A template name is stable for one desired state and different for another.
 func TestTaskTemplateNameTracksTheDesiredState(t *testing.T) {
 	task := testTask()
-	base := activities.TaskTemplateName(task, nil)
+	base := activities.TaskTemplateName(task, nil, 0)
 
 	withStatus := testTask()
 	withStatus.Status = &v1alpha1.TaskStatus{Phase: v1alpha1.PhaseRunning, WorkerIp: "10.0.0.1"}
-	if got := activities.TaskTemplateName(withStatus, nil); got != base {
+	if got := activities.TaskTemplateName(withStatus, nil, 0); got != base {
 		t.Errorf("status must not change the template name: %q vs %q", got, base)
 	}
 
 	suspended := testTask()
 	suspended.Spec.Suspend = true
-	if got := activities.TaskTemplateName(suspended, nil); got != base {
+	if got := activities.TaskTemplateName(suspended, nil, 0); got != base {
 		t.Errorf("suspending must not change the template name: %q vs %q", got, base)
 	}
 
 	reimaged := testTask()
 	reimaged.Spec.Image = "ghcr.io/example/other"
-	if got := activities.TaskTemplateName(reimaged, nil); got == base {
+	if got := activities.TaskTemplateName(reimaged, nil, 0); got == base {
 		t.Error("a new image must yield a new template name")
 	}
 
 	withWorkspace := activities.TaskTemplateName(task, []*v1alpha1.Workspace{{
 		Metadata: &v1alpha1.ObjectMeta{Name: "repo"},
-	}})
+	}}, 0)
 	if withWorkspace == base {
 		t.Error("binding a workspace must yield a new template name")
+	}
+
+	// The runner is told which sandbox it is, and that lives in the template.
+	if got := activities.TaskTemplateName(task, nil, 1); got == base {
+		t.Error("a new sandbox generation must yield a new template name")
 	}
 
 	if !activities.TaskTemplatePattern("job").MatchString(base) {
@@ -346,6 +355,36 @@ func TestObserveActor(t *testing.T) {
 	}
 	if observed.WorkerIP != "10.244.1.42" {
 		t.Errorf("expected the worker IP to be reported, got %q", observed.WorkerIP)
+	}
+	if observed.Template.Name != "job-tmpl-0a1b2c3d" {
+		t.Errorf("expected the actor's template to be reported, got %+v", observed.Template)
+	}
+}
+
+// A provisioning pass asks whether its template is there before it creates
+// one, so a rollback only deletes a template the pass made.
+func TestObserveActorTemplate(t *testing.T) {
+	control := substratetest.NewControlServer("job-tmpl-0a1b2c3d")
+	env, acts := newEnv(t, control)
+
+	observe := func(name string) bool {
+		t.Helper()
+		value, err := env.ExecuteActivity(acts.ObserveActorTemplate,
+			activities.TemplateRef{Atespace: "default", Name: name})
+		if err != nil {
+			t.Fatalf("ObserveActorTemplate failed: %v", err)
+		}
+		var observed activities.TemplateObservation
+		if err := value.Get(&observed); err != nil {
+			t.Fatalf("decoding the observation: %v", err)
+		}
+		return observed.Exists
+	}
+	if !observe("job-tmpl-0a1b2c3d") {
+		t.Error("expected the template Substrate has to be reported")
+	}
+	if observe("job-tmpl-deadbeef") {
+		t.Error("expected a template Substrate does not have to be reported missing")
 	}
 }
 
@@ -462,7 +501,7 @@ func TestActorTemplateWithholdsTheControlPlaneByDefault(t *testing.T) {
 	acts.TemporalNamespace = "default"
 
 	task := testTask()
-	name := activities.TaskTemplateName(task, nil)
+	name := activities.TaskTemplateName(task, nil, 0)
 	if _, err := env.ExecuteActivity(acts.EnsureActorTemplate, activities.TemplateInput{
 		Template:   activities.TemplateRef{Atespace: "default", Name: name},
 		Image:      task.Spec.Image,
@@ -476,7 +515,13 @@ func TestActorTemplateWithholdsTheControlPlaneByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the created template: %v", err)
 	}
-	for _, key := range []string{v1alpha1.EnvWorkflowID, v1alpha1.EnvTemporalAddress, v1alpha1.EnvTemporalNamespace} {
+	withheld := []string{
+		v1alpha1.EnvWorkflowID,
+		v1alpha1.EnvTemporalAddress,
+		v1alpha1.EnvTemporalNamespace,
+		v1alpha1.EnvSandboxGeneration,
+	}
+	for _, key := range withheld {
 		if got, ok := templateEnv[key]; ok {
 			t.Errorf("expected no %s in the container env, got %q", key, got)
 		}
@@ -587,7 +632,7 @@ func TestFailedPreconditionIsPermanentElsewhere(t *testing.T) {
 // library changes how it encodes them, and it does move when the spec does.
 func TestTaskTemplateNameCoversTheSpecFields(t *testing.T) {
 	base := testTask()
-	name := activities.TaskTemplateName(base, nil)
+	name := activities.TaskTemplateName(base, nil, 0)
 
 	changes := map[string]func(*v1alpha1.Task, []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace){
 		"command": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
@@ -622,14 +667,14 @@ func TestTaskTemplateNameCoversTheSpecFields(t *testing.T) {
 	for what, change := range changes {
 		t.Run(what, func(t *testing.T) {
 			task, workspaces := change(testTask(), nil)
-			if got := activities.TaskTemplateName(task, workspaces); got == name {
+			if got := activities.TaskTemplateName(task, workspaces, 0); got == name {
 				t.Errorf("a change to the %s must yield a new template name, both are %q", what, got)
 			}
 		})
 	}
 
 	// The same spec, built again, still names the same template.
-	if got := activities.TaskTemplateName(testTask(), nil); got != name {
+	if got := activities.TaskTemplateName(testTask(), nil, 0); got != name {
 		t.Errorf("expected %q for the same spec, got %q", name, got)
 	}
 }

@@ -28,6 +28,8 @@ import (
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"go.temporal.io/sdk/activity"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -101,6 +103,10 @@ type TemplateInput struct {
 	// WorkflowID is injected into the container so the runner can address the
 	// task workflow that owns it.
 	WorkflowID string
+	// Generation is the sandbox generation this template is built for. The
+	// runner reports it with the command's exit, so a report from a sandbox that
+	// has since been replaced can be told apart from the current one.
+	Generation int
 }
 
 // ActorInput describes the actor to provision and the template it derives from.
@@ -153,12 +159,20 @@ type ActorProvision struct {
 // ActorObservation is what the workflow needs to know about a sandbox that
 // already exists.
 type ActorObservation struct {
-	// Exists is false when Substrate no longer has the actor.
+	// Exists is false when Substrate has no such actor.
 	Exists bool
 	// State is the Substrate actor state, for example ACTOR_STATE_RUNNING.
 	State string
 	// WorkerIP is the pod IP of the worker the actor is placed on, if any.
 	WorkerIP string
+	// Template is the ActorTemplate the actor was created from. An actor on a
+	// template other than the one its task would build now has to be replaced.
+	Template TemplateRef
+}
+
+// TemplateObservation reports whether an ActorTemplate is there.
+type TemplateObservation struct {
+	Exists bool
 }
 
 // WorkspaceReadyInput describes where to probe for workspace setup completion
@@ -317,7 +331,29 @@ func (a *Activities) ObserveActor(ctx context.Context, in ActorRef) (ActorObserv
 		Exists:   true,
 		State:    actor.GetStatus().GetState().String(),
 		WorkerIP: actor.GetStatus().GetWorkerAssignment().GetWorkerPodIp(),
+		Template: TemplateRef{
+			Atespace: actor.GetActorTemplate().GetAtespace(),
+			Name:     actor.GetActorTemplate().GetName(),
+		},
 	}, nil
+}
+
+// ObserveActorTemplate reports whether an ActorTemplate exists. A provisioning
+// pass asks before it creates one, so it knows whether a rollback may delete it.
+func (a *Activities) ObserveActorTemplate(
+	ctx context.Context, in TemplateRef,
+) (TemplateObservation, error) {
+	if in.Name == "" {
+		return TemplateObservation{}, invalidSpec("template name is required")
+	}
+	_, err := a.Substrate.GetActorTemplate(ctx, in.Atespace, in.Name)
+	if status.Code(err) == codes.NotFound {
+		return TemplateObservation{}, nil
+	}
+	if err != nil {
+		return TemplateObservation{}, classify(err)
+	}
+	return TemplateObservation{Exists: true}, nil
 }
 
 // DeleteActorIfExists removes the task's actor. A missing actor is a success, so

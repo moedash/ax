@@ -55,6 +55,10 @@ const (
 	// EnvTemporalAddress and EnvTemporalNamespace are where that report goes.
 	EnvTemporalAddress   = "AX_TEMPORAL_ADDRESS"
 	EnvTemporalNamespace = "AX_TEMPORAL_NAMESPACE"
+	// EnvSandboxGeneration numbers the sandbox within its task. The runner sends
+	// it with the report, so a report from a sandbox the task has since replaced
+	// is not taken for the current one.
+	EnvSandboxGeneration = "AX_SANDBOX_GENERATION"
 )
 
 // Task phases reported on status.phase. A task's phase is derived from the state

@@ -151,9 +151,16 @@ func (r *taskRun) handleComplete(ctx workflow.Context, in CompleteInput) (*v1alp
 	return r.statusSnapshot(), nil
 }
 
+// validateComplete rejects a report the task cannot use: one for a task that is
+// going away, and one from a sandbox the task has since replaced.
 func (r *taskRun) validateComplete(ctx workflow.Context, in CompleteInput) error {
 	if r.deleting {
 		return taskTerminating(r.key())
+	}
+	if in.Generation != r.generation {
+		return temporal.NewApplicationError(
+			fmt.Sprintf("task %s replaced sandbox generation %d with %d",
+				r.key(), in.Generation, r.generation), ErrTypeStaleReport)
 	}
 	return nil
 }

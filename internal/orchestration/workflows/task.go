@@ -215,9 +215,10 @@ type taskRun struct {
 	// probing is set while the background workspace poll is running, so only one
 	// runs at a time.
 	probing bool
-	// generation counts the sandboxes this task has had. A probe carries the
-	// generation it was started for, and its answer is dropped when the sandbox
-	// it was talking to has since been replaced.
+	// generation counts the sandboxes this task has had. It names the template
+	// a sandbox is built from and is handed to the runner inside it, so a probe
+	// or a completion report from a sandbox that has since been replaced can be
+	// told from one about the current sandbox and dropped.
 	generation int
 	completed  bool
 	failed     bool
@@ -240,6 +241,7 @@ func newTaskRun(ctx workflow.Context, in TaskWorkflowInput) (*taskRun, error) {
 	r := &taskRun{
 		status:     in.Status,
 		workflowID: workflow.GetInfo(ctx).WorkflowExecution.ID,
+		generation: in.Generation,
 	}
 	if r.status == nil {
 		r.status = &v1alpha1.TaskStatus{}
@@ -352,6 +354,11 @@ func (r *taskRun) reconcile(ctx workflow.Context) error {
 // they undo, because a step whose side effect landed can still fail on the way
 // back, and each one only undoes what this pass made: rolling back must never
 // take a sandbox that was already there.
+//
+// What was already there is settled by looking before anything is created. An
+// activity's own "created" answer cannot be trusted for that: a worker that
+// dies after Substrate made the resource but before the result was recorded
+// gets "found" on the retry.
 func (r *taskRun) provision(ctx workflow.Context) error {
 	logger := workflow.GetLogger(ctx)
 
@@ -362,31 +369,65 @@ func (r *taskRun) provision(ctx workflow.Context) error {
 		Atespace: desired.Task.GetMetadata().GetAtespace(),
 		Name:     desired.Task.GetMetadata().GetName(),
 	}
-	template := activities.TemplateRef{
-		Atespace: actor.Atespace,
-		Name:     activities.TaskTemplateName(desired.Task, desired.Workspaces),
-	}
 	provisionCtx := workflow.WithActivityOptions(ctx, activities.ProvisionOptions())
+	actorCtx := workflow.WithActivityOptions(ctx, activities.ActorOptions())
 
-	// Only what this pass created may be rolled back by it, tracked per resource:
-	// a pass over a task that already has a sandbox must leave it alone.
-	templateCreated, actorCreated := false, false
+	logger.Info("provisioning task sandbox",
+		"task", r.key(), "image", desired.Task.GetSpec().GetImage())
+
+	var observed activities.ActorObservation
+	if err := workflow.ExecuteActivity(provisionCtx, acts.ObserveActor, actor).
+		Get(provisionCtx, &observed); err != nil {
+		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+			"ActorObserveFailed", err.Error())
+		return err
+	}
+
+	// Substrate binds an actor to the template it was created from, so a changed
+	// spec is only adopted by a new sandbox. An actor on any other template than
+	// the one this pass builds is replaced, and whatever it had in its workspace
+	// goes with it. A sandbox the workflow was still counting on is a new
+	// generation from here; one it had already given up on was counted already.
+	template := r.templateRef(desired)
+	replacing := observed.Exists && observed.Template.Name != template.Name
+	if replacing {
+		logger.Info("replacing the task sandbox to adopt a new spec",
+			"task", r.key(), "from", observed.Template.Name, "to", template.Name)
+		if r.provisioned != nil {
+			r.forgetSandbox(ctx, "SandboxReplaced",
+				"Sandbox is being replaced to adopt a new task spec")
+			template = r.templateRef(desired)
+		}
+	}
+
+	var templateObserved activities.TemplateObservation
+	if err := workflow.ExecuteActivity(provisionCtx, acts.ObserveActorTemplate, template).
+		Get(provisionCtx, &templateObserved); err != nil {
+		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+			"TemplateObserveFailed", err.Error())
+		return err
+	}
+
+	// Only what this pass brings into being may be rolled back by it. An actor
+	// this pass replaces is its own, because it is the one that deletes the old.
+	templateOwned := !templateObserved.Exists
+	actorOwned := !observed.Exists || replacing
 	var saga compensations
-
-	logger.Info("provisioning task sandbox", "task", r.key(), "image", desired.Task.GetSpec().GetImage())
 
 	// The atespace is shared by every task in it, so it is never rolled back.
 	if err := workflow.ExecuteActivity(provisionCtx, acts.EnsureAtespace,
 		activities.AtespaceInput{Atespace: actor.Atespace}).Get(provisionCtx, nil); err != nil {
-		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "AtespaceCreationFailed", err.Error())
+		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+			"AtespaceCreationFailed", err.Error())
 		return err
 	}
 
 	saga.add("actor template", func(ctx workflow.Context) error {
-		if !templateCreated {
+		if !templateOwned {
 			return nil
 		}
-		return workflow.ExecuteActivity(ctx, acts.DeleteActorTemplateIfExists, template).Get(ctx, nil)
+		return workflow.ExecuteActivity(ctx, acts.DeleteActorTemplateIfExists, template).
+			Get(ctx, nil)
 	})
 	var provisionedTemplate activities.TemplateProvision
 	if err := workflow.ExecuteActivity(provisionCtx, acts.EnsureActorTemplate, activities.TemplateInput{
@@ -395,61 +436,52 @@ func (r *taskRun) provision(ctx workflow.Context) error {
 		Task:       desired.Task,
 		Workspaces: desired.Workspaces,
 		WorkflowID: workflow.GetInfo(ctx).WorkflowExecution.ID,
+		Generation: r.generation,
 	}).Get(provisionCtx, &provisionedTemplate); err != nil {
 		saga.run(ctx)
-		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TemplateCreationFailed", err.Error())
+		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+			"TemplateCreationFailed", err.Error())
 		return err
 	}
-	templateCreated = provisionedTemplate.Created
 	resolved := provisionedTemplate.Template
 
 	saga.add("actor", func(ctx workflow.Context) error {
-		if !actorCreated {
+		if !actorOwned {
 			return nil
 		}
 		return workflow.ExecuteActivity(ctx, acts.DeleteActorIfExists, actor).Get(ctx, nil)
 	})
-	actorCtx := workflow.WithActivityOptions(ctx, activities.ActorOptions())
+	if replacing {
+		teardownCtx := workflow.WithActivityOptions(ctx, activities.TeardownOptions())
+		if err := workflow.ExecuteActivity(teardownCtx, acts.DeleteActorIfExists, actor).
+			Get(teardownCtx, nil); err != nil {
+			saga.run(ctx)
+			r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+				"ActorReplaceFailed", err.Error())
+			return err
+		}
+	}
 	var placed activities.ActorProvision
 	if err := workflow.ExecuteActivity(actorCtx, acts.EnsureActor,
 		activities.ActorInput{Actor: actor, Template: resolved}).Get(actorCtx, &placed); err != nil {
 		saga.run(ctx)
-		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "ActorCreationFailed", err.Error())
+		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+			"ActorCreationFailed", err.Error())
 		return err
 	}
-	actorCreated = placed.Created
-
 	if placed.Template.Name != resolved.Name {
-		// Substrate binds an actor to the template it was created from, so a
-		// changed spec is only adopted by a new sandbox. The old one is replaced,
-		// and whatever it had in its workspace goes with it.
-		logger.Info("replacing the task sandbox to adopt a new spec",
-			"task", r.key(), "from", placed.Template.Name, "to", resolved.Name)
-		r.forgetSandbox(ctx, "SandboxReplaced", "Sandbox is being replaced to adopt a new task spec")
-
-		teardownCtx := workflow.WithActivityOptions(ctx, activities.TeardownOptions())
-		if err := workflow.ExecuteActivity(teardownCtx, acts.DeleteActorIfExists, actor).Get(teardownCtx, nil); err != nil {
-			r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "ActorReplaceFailed", err.Error())
-			return err
-		}
-		if err := workflow.ExecuteActivity(actorCtx, acts.EnsureActor,
-			activities.ActorInput{Actor: actor, Template: resolved}).Get(actorCtx, &placed); err != nil {
-			saga.run(ctx)
-			r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "ActorCreationFailed", err.Error())
-			return err
-		}
-		actorCreated = actorCreated || placed.Created
-		if placed.Template.Name != resolved.Name {
-			err := fmt.Errorf("actor %s/%s is on template %q, not %q",
-				actor.Atespace, actor.Name, placed.Template.Name, resolved.Name)
-			saga.run(ctx)
-			r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TemplateNotAdopted", err.Error())
-			return err
-		}
+		// An actor that appeared between the look and the create is on a template
+		// this pass did not choose. The next pass sees it and replaces it.
+		err := fmt.Errorf("actor %s/%s is on template %q, not %q",
+			actor.Atespace, actor.Name, placed.Template.Name, resolved.Name)
+		saga.run(ctx)
+		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+			"TemplateNotAdopted", err.Error())
+		return err
 	}
 
 	saga.add("egress policy", func(ctx workflow.Context) error {
-		if !actorCreated {
+		if !actorOwned {
 			return nil
 		}
 		return workflow.ExecuteActivity(ctx, acts.DeleteEgressPolicyIfExists, actor).Get(ctx, nil)
@@ -457,17 +489,24 @@ func (r *taskRun) provision(ctx workflow.Context) error {
 	allowlist, restricted := egressAllowlist(desired.Gateway)
 	if err := workflow.ExecuteActivity(provisionCtx, acts.ApplyEgressPolicy,
 		activities.EgressInput{Actor: actor, Allowlist: allowlist}).Get(provisionCtx, nil); err != nil {
-		r.setCondition(ctx, v1alpha1.ConditionGatewayReady, v1alpha1.ConditionFalse, "PolicyApplyFailed", err.Error())
+		r.setCondition(ctx, v1alpha1.ConditionGatewayReady, v1alpha1.ConditionFalse,
+			"PolicyApplyFailed", err.Error())
 		if restricted {
 			// A task bound to a gateway must not run without the gateway's
-			// allowlist, so a sandbox this pass created is rolled back instead.
+			// allowlist. A sandbox this pass created is rolled back; one it found
+			// is stopped, which keeps its workspace for a later apply that works.
 			saga.run(ctx)
-			r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "PolicyApplyFailed", err.Error())
+			if !actorOwned && observed.State != activities.ActorStateSuspended {
+				r.stopUnrestricted(ctx, actor)
+			}
+			r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+				"PolicyApplyFailed", err.Error())
 			return err
 		}
 		logger.Warn("could not apply the default egress policy", "task", r.key(), "error", err)
 	} else {
-		r.setCondition(ctx, v1alpha1.ConditionGatewayReady, v1alpha1.ConditionTrue, "PoliciesApplied", "Network policies active")
+		r.setCondition(ctx, v1alpha1.ConditionGatewayReady, v1alpha1.ConditionTrue,
+			"PoliciesApplied", "Network policies active")
 	}
 
 	// Stamped from the snapshot, so a spec that arrived mid-pass is not recorded
@@ -477,6 +516,30 @@ func (r *taskRun) provision(ctx workflow.Context) error {
 	r.workspaceProbed = r.conditionTrue(v1alpha1.ConditionWorkspaceReady)
 	r.status.Actor = actor.Name
 	return nil
+}
+
+// templateRef names the ActorTemplate the task's current sandbox generation is
+// built from.
+func (r *taskRun) templateRef(desired *TaskDesiredState) activities.TemplateRef {
+	return activities.TemplateRef{
+		Atespace: desired.Task.GetMetadata().GetAtespace(),
+		Name:     activities.TaskTemplateName(desired.Task, desired.Workspaces, r.generation),
+	}
+}
+
+// stopUnrestricted suspends a sandbox the pass found running without the
+// allowlist its task requires. Suspending rather than deleting keeps the
+// workspace; nothing runs in it until a policy can be applied.
+func (r *taskRun) stopUnrestricted(ctx workflow.Context, actor activities.ActorRef) {
+	suspendCtx := workflow.WithActivityOptions(ctx, activities.ActorOptions())
+	if err := workflow.ExecuteActivity(suspendCtx, acts.SuspendActor, actor).
+		Get(suspendCtx, nil); err != nil {
+		workflow.GetLogger(ctx).Error("could not stop a sandbox that runs without its allowlist",
+			"task", r.key(), "error", err)
+		return
+	}
+	r.sandbox = sandboxSuspended
+	r.status.WorkerIp = ""
 }
 
 // activate brings the sandbox into the state the spec asks for: suspended and
@@ -633,14 +696,18 @@ func (r *taskRun) resync(ctx workflow.Context, cfg Config) {
 
 // forgetSandbox drops what the workflow believes about the sandbox so the next
 // pass builds a new one. The workspace inside a replacement sandbox is set up
-// from scratch, so its readiness has to be established again too.
+// from scratch, so its readiness has to be established again too, and the
+// command inside it has not run yet, so how the old one ended is dropped.
 func (r *taskRun) forgetSandbox(ctx workflow.Context, reason, message string) {
 	r.provisioned = nil
 	r.sandbox = sandboxUnknown
 	r.status.WorkerIp = ""
 	r.workspaceProbed = false
+	r.completed = false
+	r.status.ExitCode = nil
 	// A probe still talking to the old sandbox is now stale: its answer is
-	// dropped, and the replacement gets a probe of its own.
+	// dropped, and the replacement gets a probe of its own. The same goes for a
+	// completion report the old sandbox has yet to send.
 	r.probing = false
 	r.generation++
 	r.setCondition(ctx, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionFalse, reason, message)
@@ -716,8 +783,9 @@ func (r *taskRun) pending() bool {
 // without provisioning from scratch.
 func (r *taskRun) continueInput() TaskWorkflowInput {
 	return TaskWorkflowInput{
-		Desired: cloneDesired(r.desired),
-		Status:  r.statusSnapshot(),
+		Desired:    cloneDesired(r.desired),
+		Status:     r.statusSnapshot(),
+		Generation: r.generation,
 	}
 }
 
@@ -800,8 +868,15 @@ func (r *taskRun) upsertSearchAttributes(ctx workflow.Context) {
 }
 
 // recordCompletion stores how the task command finished. The sandbox stays up
-// so that its workspace can still be inspected.
+// so that its workspace can still be inspected. A report from a sandbox the
+// task has since replaced is dropped here as well as in the update validator,
+// because the signal path has no validator.
 func (r *taskRun) recordCompletion(ctx workflow.Context, in CompleteInput) {
+	if in.Generation != r.generation {
+		workflow.GetLogger(ctx).Info("dropping a completion report from a replaced sandbox",
+			"task", r.key(), "reported", in.Generation, "current", r.generation)
+		return
+	}
 	exitCode := in.ExitCode
 	r.completed = true
 	r.status.ExitCode = &exitCode

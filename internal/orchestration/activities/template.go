@@ -36,9 +36,15 @@ import (
 const templateDigestBytes = 4
 
 // TaskTemplateName derives a task's ActorTemplate name from the specs that end
-// up inside the container: the task itself and every workspace it binds. A spec
-// change yields a new template, and an unchanged spec always yields the same
-// one, which is what makes template provisioning idempotent.
+// up inside the container, the task itself and every workspace it binds, and
+// from the sandbox generation the template is built for. A spec change yields
+// a new template, and an unchanged spec for the same generation always yields
+// the same one, which is what makes template provisioning idempotent.
+//
+// The generation is in the name because it is in the container: the runner
+// reports it with the command's exit, and the workflow drops a report from a
+// sandbox it has since replaced. Substrate fixes a template's environment when
+// the template is created, so each generation needs a template of its own.
 //
 // The digest is taken over named fields rather than over marshaled bytes. Wire
 // bytes are a property of the protobuf library, so an upgrade of it could
@@ -47,10 +53,13 @@ const templateDigestBytes = 4
 // The digest deliberately covers only the desired state. Task status, the
 // suspend flag, and resolved credentials are excluded so that a status update
 // or a rotated key does not strand a fresh template on every reconcile.
-func TaskTemplateName(task *v1alpha1.Task, workspaces []*v1alpha1.Workspace) string {
+func TaskTemplateName(
+	task *v1alpha1.Task, workspaces []*v1alpha1.Workspace, generation int,
+) string {
 	d := &digest{h: sha256.New()}
 	spec := SandboxSpec(task).GetSpec()
 
+	d.field("generation", strconv.Itoa(generation))
 	d.field("image", spec.GetImage())
 	for _, arg := range spec.GetCommand() {
 		d.field("command", arg)
@@ -187,6 +196,7 @@ func (a *Activities) containerEnv(ctx context.Context, in TemplateInput) (map[st
 		if a.TemporalNamespace != "" {
 			env[v1alpha1.EnvTemporalNamespace] = a.TemporalNamespace
 		}
+		env[v1alpha1.EnvSandboxGeneration] = strconv.Itoa(in.Generation)
 	}
 	return env, nil
 }
