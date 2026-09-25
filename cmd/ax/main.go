@@ -886,13 +886,15 @@ func deleteResource(ctx context.Context, client v1alpha1.AXClient, kind, atespac
 	return nil
 }
 
-// waitForDeletion polls until the resource returns NotFound or ctx expires.
+// waitForDeletion polls until the resource returns NotFound or ctx expires. A
+// task whose teardown failed stays, reported Failed with what was left behind,
+// so that ends the wait too rather than running it out.
 func waitForDeletion(ctx context.Context, client v1alpha1.AXClient, kind, atespace, name string) error {
-	lookup := func() error {
+	lookup := func() (*v1alpha1.Task, error) {
 		var err error
 		switch kind {
 		case v1alpha1.KindTask:
-			_, err = client.GetTask(ctx, &v1alpha1.GetTaskRequest{Atespace: atespace, Name: name})
+			return client.GetTask(ctx, &v1alpha1.GetTaskRequest{Atespace: atespace, Name: name})
 		case v1alpha1.KindGateway:
 			_, err = client.GetGateway(ctx, &v1alpha1.GetGatewayRequest{Atespace: atespace, Name: name})
 		case v1alpha1.KindWorkspace:
@@ -900,17 +902,21 @@ func waitForDeletion(ctx context.Context, client v1alpha1.AXClient, kind, atespa
 		case v1alpha1.KindModel:
 			_, err = client.GetModel(ctx, &v1alpha1.GetModelRequest{Atespace: atespace, Name: name})
 		}
-		return err
+		return nil, err
 	}
 
 	announced := false
 	for {
-		err := lookup()
+		task, err := lookup()
 		if status.Code(err) == codes.NotFound {
 			return nil
 		}
 		if err != nil {
 			return fmt.Errorf("checking %s %s/%s after delete: %w", strings.ToLower(kind), atespace, name, err)
+		}
+		if message := teardownFailure(task); message != "" {
+			return fmt.Errorf("%s %s/%s could not be released: %s (fix the cause and run `ax delete` again)",
+				strings.ToLower(kind), atespace, name, message)
 		}
 		if !announced {
 			fmt.Fprintf(os.Stderr, "waiting for %s %s/%s to be deleted...\n", strings.ToLower(kind), atespace, name)
@@ -922,6 +928,22 @@ func waitForDeletion(ctx context.Context, client v1alpha1.AXClient, kind, atespa
 		case <-time.After(deletePollInterval):
 		}
 	}
+}
+
+// teardownFailure returns what a task's teardown left behind, or "" while the
+// task is still going away. The condition alone is not enough: a task being
+// deleted again still carries the reason from the attempt before, so only a
+// task that has settled on Failed has really given up.
+func teardownFailure(task *v1alpha1.Task) string {
+	if task.GetStatus().GetPhase() != v1alpha1.PhaseFailed {
+		return ""
+	}
+	for _, c := range task.GetStatus().GetConditions() {
+		if c.GetType() == v1alpha1.ConditionReady && c.GetReason() == "TeardownFailed" {
+			return c.GetMessage()
+		}
+	}
+	return ""
 }
 
 // normalizeKind maps user-typed kinds ("task", "tasks", "Task") to the canonical
