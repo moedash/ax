@@ -136,7 +136,7 @@ func runTask(ctx workflow.Context, cfg Config, in TaskWorkflowInput) error {
 	for !r.deleted {
 		for !r.deleting {
 			handling := r.requests
-			r.converge(ctx)
+			r.interruptible(ctx, r.converge)
 			r.handled = handling
 
 			if r.deleting {
@@ -175,7 +175,7 @@ func runTask(ctx workflow.Context, cfg Config, in TaskWorkflowInput) error {
 				return err
 			}
 			if !requested {
-				r.resync(ctx, cfg)
+				r.interruptible(ctx, func(ctx workflow.Context) { r.resync(ctx, cfg) })
 			}
 		}
 
@@ -232,16 +232,34 @@ type taskRun struct {
 	// Failed, rather than sliding back to Running as if nothing had happened.
 	teardownFailed bool
 
+	// interrupt cancels the step the main loop is in, so a delete does not wait
+	// for a pass that is still retrying. It is nil between steps.
+	interrupt workflow.CancelFunc
+
 	completions workflow.ReceiveChannel
+}
+
+// interruptible runs one step of the main loop under a context handleDelete
+// can cancel. An activity the step is waiting on returns cancelled, the step
+// fails, and the loop moves on to the teardown.
+func (r *taskRun) interruptible(ctx workflow.Context, step func(workflow.Context)) {
+	stepCtx, cancel := workflow.WithCancel(ctx)
+	r.interrupt = cancel
+	step(stepCtx)
+	r.interrupt = nil
+	cancel()
 }
 
 // newTaskRun validates the input and puts the task into the shape the rest of
 // the workflow expects.
 func newTaskRun(ctx workflow.Context, in TaskWorkflowInput) (*taskRun, error) {
 	r := &taskRun{
-		status:     in.Status,
-		workflowID: workflow.GetInfo(ctx).WorkflowExecution.ID,
-		generation: in.Generation,
+		status:          in.Status,
+		workflowID:      workflow.GetInfo(ctx).WorkflowExecution.ID,
+		generation:      in.Generation,
+		failed:          in.Failed,
+		teardownFailed:  in.TeardownFailed,
+		teardownMessage: in.TeardownMessage,
 	}
 	if r.status == nil {
 		r.status = &v1alpha1.TaskStatus{}
@@ -274,6 +292,9 @@ func (r *taskRun) adopt(ctx workflow.Context, desired *TaskDesiredState) error {
 	}
 	if desired.Task.GetMetadata().GetName() == "" {
 		return temporal.NewNonRetryableApplicationError("task name is required", ErrTypeInvalidTask, nil)
+	}
+	if err := r.ownsTask(desired.Task); err != nil {
+		return temporal.NewNonRetryableApplicationError(err.Error(), ErrTypeInvalidTask, nil)
 	}
 	if err := v1alpha1.ValidateTask(desired.Task); err != nil {
 		return temporal.NewNonRetryableApplicationError(err.Error(), ErrTypeInvalidTask, nil)
@@ -678,6 +699,12 @@ func (r *taskRun) resync(ctx workflow.Context, cfg Config) {
 	case observed.State == activities.ActorStateSuspended && !r.desired.Task.GetSpec().GetSuspend():
 		r.sandbox = sandboxSuspended
 		r.status.WorkerIp = ""
+	case observed.State == activities.ActorStateRunning && r.desired.Task.GetSpec().GetSuspend():
+		// The router resumes a suspended actor when a request reaches it. The
+		// task was told to stay suspended, so the next pass suspends it again.
+		logger.Info("task sandbox was resumed behind the task's back", "task", r.key())
+		r.sandbox = sandboxRunning
+		r.status.WorkerIp = observed.WorkerIP
 	case observed.State == activities.ActorStateRunning && observed.WorkerIP != r.status.GetWorkerIp():
 		logger.Info("task sandbox moved", "task", r.key(), "workerIP", observed.WorkerIP)
 		r.status.WorkerIp = observed.WorkerIP
@@ -783,9 +810,12 @@ func (r *taskRun) pending() bool {
 // without provisioning from scratch.
 func (r *taskRun) continueInput() TaskWorkflowInput {
 	return TaskWorkflowInput{
-		Desired:    cloneDesired(r.desired),
-		Status:     r.statusSnapshot(),
-		Generation: r.generation,
+		Desired:         cloneDesired(r.desired),
+		Status:          r.statusSnapshot(),
+		Generation:      r.generation,
+		Failed:          r.failed,
+		TeardownFailed:  r.teardownFailed,
+		TeardownMessage: r.teardownMessage,
 	}
 }
 

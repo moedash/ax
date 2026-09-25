@@ -1066,6 +1066,151 @@ func (s *taskWorkflowSuite) TestReplacingTheSandboxResetsCompletion() {
 	s.Nil(replaced.GetStatus().ExitCode)
 }
 
+// A spec whose identity names another workflow cannot be applied here, whatever
+// client sent it: the actor would land in one atespace while the ID said
+// another.
+func (s *taskWorkflowSuite) TestApplyRejectsASpecForAnotherTask() {
+	other := testInput().Desired
+	other.Task.Metadata.Atespace = "team-b"
+
+	rejected := false
+	s.env.RegisterDelayedCallback(func() {
+		s.env.UpdateWorkflow(workflows.UpdateApply, "apply-other", &testsuite.TestUpdateCallback{
+			OnReject:   func(error) { rejected = true },
+			OnAccept:   func() {},
+			OnComplete: func(any, error) {},
+		}, other)
+	}, time.Second)
+	s.delete(2 * time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.True(rejected, "a spec for another task is refused")
+	s.Equal([]string{"default"}, s.calls.get(&s.calls.atespaces),
+		"nothing is provisioned in the other atespace")
+}
+
+// Before the first apply there is no spec to change and no sandbox to report
+// on, so those updates are refused rather than dereferencing nothing.
+func (s *taskWorkflowSuite) TestChangesBeforeTheFirstApplyAreRejected() {
+	rejected := map[string]bool{}
+	refuse := func(update string, args ...any) {
+		s.env.UpdateWorkflow(update, update+"-early", &testsuite.TestUpdateCallback{
+			OnReject:   func(error) { rejected[update] = true },
+			OnAccept:   func() {},
+			OnComplete: func(any, error) {},
+		}, args...)
+	}
+	s.env.RegisterDelayedCallback(func() {
+		refuse(workflows.UpdateSuspend)
+		refuse(workflows.UpdateResume)
+		refuse(workflows.UpdateComplete, workflows.CompleteInput{ExitCode: 0})
+	}, time.Second)
+
+	// The start carries nothing and the apply never comes, so the task gives up.
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, workflows.TaskWorkflowInput{})
+	s.True(s.env.IsWorkflowCompleted())
+
+	for _, update := range []string{workflows.UpdateSuspend, workflows.UpdateResume, workflows.UpdateComplete} {
+		s.True(rejected[update], "%s before the first apply should be rejected", update)
+	}
+}
+
+// A delete does not wait for a pass that is still retrying its way to a
+// sandbox: the teardown starts as soon as the delete lands.
+func (s *taskWorkflowSuite) TestDeleteInterruptsARetryingProvision() {
+	s.calls.actorErr = temporal.NewApplicationError("substrate unavailable", activities.ErrTypeSubstrate)
+	start := s.env.Now()
+	s.delete(time.Minute)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+
+	s.True(s.env.IsWorkflowCompleted())
+	s.NoError(s.env.GetWorkflowError())
+	s.Less(s.env.Now().Sub(start), 5*time.Minute,
+		"the delete must not wait out the provisioning budget")
+	s.Contains(s.calls.get(&s.calls.delActors), "test-task")
+	s.Contains(s.calls.get(&s.calls.delTmpl), "test-task")
+}
+
+// A task that could not be released stays Failed, and says why, across a
+// continue-as-new boundary.
+func (s *taskWorkflowSuite) TestContinuedRunKeepsATeardownFailure() {
+	in := testInput()
+	in.TeardownFailed = true
+	in.TeardownMessage = "Actor default/test-task is still there: wedged"
+	in.Status = &v1alpha1.TaskStatus{
+		Phase: v1alpha1.PhaseFailed,
+		Actor: "test-task",
+		Id:    "task-test-task-1",
+	}
+
+	var status *v1alpha1.TaskStatus
+	s.env.RegisterDelayedCallback(func() { status = s.queryStatus() }, time.Second)
+	s.delete(2 * time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, in)
+	s.Require().NoError(s.env.GetWorkflowError(), "the delete releases the task")
+
+	s.Require().NotNil(status)
+	s.Equal(v1alpha1.PhaseFailed, status.GetPhase())
+	assertCondition(s.T(), status, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TeardownFailed")
+}
+
+// The run that continues as new hands a teardown failure on to the next one.
+func (s *taskWorkflowSuite) TestContinueAsNewCarriesATeardownFailure() {
+	s.env.SetContinueAsNewSuggested(true)
+	s.calls.deleteActorErr = temporal.NewNonRetryableApplicationError(
+		"actor is wedged", activities.ErrTypePermanent, nil)
+
+	var deleteErr error
+	s.env.RegisterDelayedCallback(func() {
+		s.env.UpdateWorkflow(workflows.UpdateDelete, "delete-1", &testsuite.TestUpdateCallback{
+			OnReject:   func(err error) { s.Failf("delete rejected", "%v", err) },
+			OnAccept:   func() {},
+			OnComplete: func(_ any, err error) { deleteErr = err },
+		})
+	}, 0)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+
+	s.True(s.env.IsWorkflowCompleted())
+	var continued *workflow.ContinueAsNewError
+	s.Require().ErrorAs(s.env.GetWorkflowError(), &continued)
+	s.Require().Error(deleteErr, "the delete reports what was left behind")
+
+	var next workflows.TaskWorkflowInput
+	s.Require().NoError(converter.GetDefaultDataConverter().FromPayloads(continued.Input, &next))
+	s.True(next.TeardownFailed, "the next run has to know the task could not be released")
+	s.Contains(next.TeardownMessage, "still there")
+	s.Equal(v1alpha1.PhaseFailed, next.Status.GetPhase())
+}
+
+// The router resumes a suspended actor when a request reaches it. The task was
+// told to stay suspended, so the resync puts it back.
+func (s *taskWorkflowSuite) TestResyncReSuspendsATaskResumedOutOfBand() {
+	in := testInput()
+	in.Desired.Task.Spec.Suspend = true
+	s.calls.observation = &activities.ActorObservation{
+		Exists:   true,
+		State:    activities.ActorStateRunning,
+		WorkerIP: "10.244.1.42",
+	}
+
+	var status *v1alpha1.TaskStatus
+	s.env.RegisterDelayedCallback(func() { status = s.queryStatus() }, 6*time.Minute)
+	s.delete(6*time.Minute + time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, in)
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.Equal([]string{"test-task", "test-task"}, s.calls.get(&s.calls.suspends),
+		"the resync suspends the sandbox again")
+	s.Require().NotNil(status)
+	s.Equal(v1alpha1.PhaseSuspended, status.GetPhase())
+}
+
 // A start that is never followed by its update does not sit there forever.
 func (s *taskWorkflowSuite) TestAStartWithNoSpecGivesUp() {
 	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, workflows.TaskWorkflowInput{})

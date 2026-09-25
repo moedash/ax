@@ -133,6 +133,12 @@ type TaskWorkflowInput struct {
 	// continue-as-new boundary so the next run names the same template and
 	// accepts reports from the same sandbox.
 	Generation int
+	// Failed, TeardownFailed, and TeardownMessage carry what the status alone
+	// cannot say across a continue-as-new boundary: why the task reports Failed,
+	// and what a teardown that could not finish left behind.
+	Failed          bool
+	TeardownFailed  bool
+	TeardownMessage string
 }
 
 // CompleteInput reports how the task command finished.

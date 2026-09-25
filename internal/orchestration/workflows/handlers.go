@@ -104,15 +104,22 @@ func (r *taskRun) validateApply(ctx workflow.Context, desired *TaskDesiredState)
 	if desired == nil || desired.Task == nil {
 		return temporal.NewApplicationError("task is required", ErrTypeInvalidTask)
 	}
-	// A task's name is its identity. Once it has one, nothing else may be
-	// applied over it; before then, the first apply is what gives it one.
-	name := desired.Task.GetMetadata().GetName()
-	if current := r.desired.GetTask().GetMetadata().GetName(); current != "" && name != current {
-		return temporal.NewApplicationError(
-			fmt.Sprintf("task %q cannot be applied to %s", name, r.key()), ErrTypeInvalidTask)
+	if err := r.ownsTask(desired.Task); err != nil {
+		return temporal.NewApplicationError(err.Error(), ErrTypeInvalidTask)
 	}
 	if err := v1alpha1.ValidateTask(desired.Task); err != nil {
 		return temporal.NewApplicationError(err.Error(), ErrTypeInvalidTask)
+	}
+	return nil
+}
+
+// ownsTask rejects a spec for some other task. A task's atespace and name are
+// its identity and its workflow ID, so a spec whose identity names another
+// workflow cannot be applied here, whatever client sent it.
+func (r *taskRun) ownsTask(task *v1alpha1.Task) error {
+	id := TaskWorkflowID(task.GetMetadata().GetAtespace(), task.GetMetadata().GetName())
+	if id != r.workflowID {
+		return fmt.Errorf("task %s cannot be applied to %s", id, r.workflowID)
 	}
 	return nil
 }
@@ -136,10 +143,15 @@ func (r *taskRun) handleResume(ctx workflow.Context) (*v1alpha1.Task, error) {
 	return r.taskSnapshot(), nil
 }
 
-// validateRunning rejects changes to a task that is going away.
+// validateRunning rejects changes to a task that is going away, and to one
+// that has no spec yet: there is nothing to suspend or resume until the first
+// apply has landed.
 func (r *taskRun) validateRunning(ctx workflow.Context) error {
 	if r.deleting {
 		return taskTerminating(r.key())
+	}
+	if r.desired == nil {
+		return taskNotApplied(r.key())
 	}
 	return nil
 }
@@ -156,6 +168,9 @@ func (r *taskRun) handleComplete(ctx workflow.Context, in CompleteInput) (*v1alp
 func (r *taskRun) validateComplete(ctx workflow.Context, in CompleteInput) error {
 	if r.deleting {
 		return taskTerminating(r.key())
+	}
+	if r.desired == nil {
+		return taskNotApplied(r.key())
 	}
 	if in.Generation != r.generation {
 		return temporal.NewApplicationError(
@@ -175,6 +190,12 @@ func (r *taskRun) handleDelete(ctx workflow.Context) error {
 	r.teardownFailed = false
 	r.request()
 	r.syncPhase(ctx)
+	// A pass that is still retrying its way to a sandbox has nothing left to
+	// build. Interrupting it is what lets the teardown start now rather than
+	// when the pass gives up.
+	if r.interrupt != nil {
+		r.interrupt()
+	}
 
 	if err := workflow.Await(ctx, func() bool {
 		return r.deleted || r.teardownFailures > failures
@@ -210,5 +231,11 @@ func (r *taskRun) awaitHandled(ctx workflow.Context, target int) error {
 }
 
 func taskTerminating(key string) error {
-	return temporal.NewApplicationError(fmt.Sprintf("task %s is being deleted", key), ErrTypeTaskTerminating)
+	return temporal.NewApplicationError(
+		fmt.Sprintf("task %s is being deleted", key), ErrTypeTaskTerminating)
+}
+
+func taskNotApplied(key string) error {
+	return temporal.NewApplicationError(
+		fmt.Sprintf("task %s has no spec yet", key), ErrTypeInvalidTask)
 }
