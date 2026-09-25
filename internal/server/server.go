@@ -34,9 +34,21 @@ import (
 	"github.com/google/ax/pkg/apis/v1alpha1"
 )
 
-// defaultWatchPollInterval is how often WatchTask asks a task for its state.
-// Each interval is one query per open watch, so it is not free.
-const defaultWatchPollInterval = 2 * time.Second
+const (
+	// defaultWatchPollInterval is how often WatchTask asks a task for its state.
+	// Each interval is one query per open watch, so it is not free.
+	defaultWatchPollInterval = 2 * time.Second
+
+	// maxUnavailablePolls is how many polls in a row a watch sits through with
+	// no worker answering for the task before it gives up. A controller rollout
+	// takes seconds; a task nobody answers for much longer than that is a
+	// problem the watcher should hear about.
+	maxUnavailablePolls = 15
+
+	// maxListTasks caps one listing. Anything larger walks visibility page by
+	// page on the caller's behalf, and a caller that wants more can page.
+	maxListTasks = 500
+)
 
 // Options configures the API server.
 type Options struct {
@@ -100,7 +112,10 @@ func (s *Server) GetTask(ctx context.Context, req *v1alpha1.GetTaskRequest) (*v1
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "missing request")
 	}
-	atespace := atespaceOf(req.Atespace)
+	atespace, err := taskRef(req.Atespace, req.Name)
+	if err != nil {
+		return nil, err
+	}
 	task, err := s.tasks.Get(ctx, atespace, req.Name)
 	if err != nil {
 		return nil, taskError(err, atespace, req.Name)
@@ -108,17 +123,24 @@ func (s *Server) GetTask(ctx context.Context, req *v1alpha1.GetTaskRequest) (*v1
 	return task, nil
 }
 
-func (s *Server) ListTasks(ctx context.Context, req *v1alpha1.ListTasksRequest) (*v1alpha1.ListTasksResponse, error) {
+func (s *Server) ListTasks(
+	ctx context.Context, req *v1alpha1.ListTasksRequest,
+) (*v1alpha1.ListTasksResponse, error) {
 	atespace := ""
 	limit := int64(50)
 	offset := int64(0)
 	if req != nil {
 		atespace = req.Atespace
 		if req.Limit > 0 {
-			limit = req.Limit
+			limit = min(req.Limit, maxListTasks)
 		}
 		if req.Offset > 0 {
 			offset = req.Offset
+		}
+	}
+	if atespace != "" && atespace != "*" {
+		if err := v1alpha1.ValidateAtespace(atespace); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
 	}
 	tasks, err := s.tasks.List(ctx, atespace, limit, offset)
@@ -154,11 +176,16 @@ func (s *Server) UpdateTask(ctx context.Context, req *v1alpha1.UpdateTaskRequest
 	return applied, nil
 }
 
-func (s *Server) DeleteTask(ctx context.Context, req *v1alpha1.DeleteTaskRequest) (*v1alpha1.DeleteTaskResponse, error) {
+func (s *Server) DeleteTask(
+	ctx context.Context, req *v1alpha1.DeleteTaskRequest,
+) (*v1alpha1.DeleteTaskResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "missing request")
 	}
-	atespace := atespaceOf(req.Atespace)
+	atespace, err := taskRef(req.Atespace, req.Name)
+	if err != nil {
+		return nil, err
+	}
 	// Deletion is asynchronous: the task moves to Terminating while its sandbox
 	// is torn down, and disappears once that has finished. Clients poll GetTask
 	// for NotFound.
@@ -172,7 +199,10 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "missing request")
 	}
-	atespace := atespaceOf(req.Atespace)
+	atespace, err := taskRef(req.Atespace, req.Name)
+	if err != nil {
+		return nil, err
+	}
 	task, err := s.tasks.Suspend(ctx, atespace, req.Name)
 	if err != nil {
 		return nil, taskError(err, atespace, req.Name)
@@ -184,7 +214,10 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "missing request")
 	}
-	atespace := atespaceOf(req.Atespace)
+	atespace, err := taskRef(req.Atespace, req.Name)
+	if err != nil {
+		return nil, err
+	}
 	task, err := s.tasks.Resume(ctx, atespace, req.Name)
 	if err != nil {
 		return nil, taskError(err, atespace, req.Name)
@@ -192,14 +225,33 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 	return task, nil
 }
 
+// taskRef validates the identity a task call names and returns the atespace
+// with the default filled in. Names and atespaces become workflow IDs, so
+// they are checked on every path that builds one, not only on the write.
+func taskRef(atespace, name string) (string, error) {
+	atespace = atespaceOf(atespace)
+	if err := v1alpha1.ValidateMetadata(&v1alpha1.ObjectMeta{Name: name, Atespace: atespace}); err != nil {
+		return "", status.Error(codes.InvalidArgument, err.Error())
+	}
+	return atespace, nil
+}
+
 // WatchTask streams a task's state as it changes. It asks the task for its
 // state on an interval and emits whatever is different, until the task is ready,
 // has finished, has failed, or is gone.
-func (s *Server) WatchTask(req *v1alpha1.WatchTaskRequest, stream grpc.ServerStreamingServer[v1alpha1.WatchTaskResponse]) error {
+//
+// A task nobody answers for is not gone: the worker may be restarting. The
+// watch sits through a bounded number of such polls before it gives up.
+func (s *Server) WatchTask(
+	req *v1alpha1.WatchTaskRequest, stream grpc.ServerStreamingServer[v1alpha1.WatchTaskResponse],
+) error {
 	if req == nil {
 		return status.Error(codes.InvalidArgument, "missing request")
 	}
-	atespace := atespaceOf(req.Atespace)
+	atespace, err := taskRef(req.Atespace, req.Name)
+	if err != nil {
+		return err
+	}
 	ctx := stream.Context()
 
 	ticker := time.NewTicker(s.watchPollInterval)
@@ -207,13 +259,23 @@ func (s *Server) WatchTask(req *v1alpha1.WatchTaskRequest, stream grpc.ServerStr
 
 	var last *v1alpha1.Task
 	action := "INITIAL"
+	unavailable := 0
 	for {
 		task, err := s.tasks.Get(ctx, atespace, req.Name)
 		switch {
 		case err == nil:
+			unavailable = 0
 		case errors.Is(err, orchestration.ErrTaskNotFound) && last != nil:
 			// The task was deleted while it was being watched.
 			return stream.Send(&v1alpha1.WatchTaskResponse{Task: last, Action: "DELETED"})
+		case errors.Is(err, orchestration.ErrTaskUnavailable) && unavailable < maxUnavailablePolls:
+			unavailable++
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+			}
+			continue
 		default:
 			return taskError(err, atespace, req.Name)
 		}

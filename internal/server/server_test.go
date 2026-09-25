@@ -423,6 +423,124 @@ func TestWatchTaskStreamsUntilReady(t *testing.T) {
 	}
 }
 
+// serveGRPC serves the API over a listener and returns a client for it. The
+// server and the connection are closed with the test.
+func serveGRPC(t *testing.T, srv *server.Server) v1alpha1.AXClient {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	httpServer := &http.Server{Handler: srv.Handler()}
+	httpServer.Protocols = new(http.Protocols)
+	httpServer.Protocols.SetHTTP1(true)
+	httpServer.Protocols.SetUnencryptedHTTP2(true)
+	go func() { _ = httpServer.Serve(ln) }()
+	t.Cleanup(func() { _ = httpServer.Close() })
+
+	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to dial gRPC: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return v1alpha1.NewAXClient(conn)
+}
+
+// A worker restart makes a task unanswerable for a few seconds. A watch waits
+// that out rather than ending on the first unanswered poll, and gives up only
+// when nothing answers for much longer than a restart takes.
+func TestWatchTaskOutlastsAWorkerRestart(t *testing.T) {
+	tasks := newFakeTasks()
+	tasks.ready = true
+	client := serveGRPC(t, server.NewServer(memory.NewStore(), tasks,
+		server.Options{WatchPollInterval: 10 * time.Millisecond}))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if _, err := client.UpdateTask(ctx, &v1alpha1.UpdateTaskRequest{Task: &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "watched"},
+		Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+	}}); err != nil {
+		t.Fatalf("UpdateTask failed: %v", err)
+	}
+
+	tasks.workerAway(3)
+	stream, err := client.WatchTask(ctx, &v1alpha1.WatchTaskRequest{Atespace: "default", Name: "watched"})
+	if err != nil {
+		t.Fatalf("WatchTask failed: %v", err)
+	}
+	initial, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("expected the watch to wait for the worker, got %v", err)
+	}
+	if initial.GetAction() != "INITIAL" {
+		t.Errorf("expected INITIAL once the worker answered, got %q", initial.GetAction())
+	}
+
+	tasks.workerAway(1000)
+	stream, err = client.WatchTask(ctx, &v1alpha1.WatchTaskRequest{Atespace: "default", Name: "watched"})
+	if err != nil {
+		t.Fatalf("WatchTask failed: %v", err)
+	}
+	if _, err := stream.Recv(); status.Code(err) != codes.Unavailable {
+		t.Errorf("expected a watch nobody answers to give up as Unavailable, got %v", err)
+	}
+}
+
+// A name or atespace becomes a workflow ID on every task call, not only on the
+// write, so every path checks it before building one.
+func TestTaskReadsRejectNamesThatAreNotDNSLabels(t *testing.T) {
+	srv := server.NewServer(memory.NewStore(), newFakeTasks(), server.Options{})
+	ctx := context.Background()
+	const bad = "job' OR '1'='1"
+
+	calls := map[string]func() error{
+		"GetTask": func() error {
+			_, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: bad})
+			return err
+		},
+		"GetTask atespace": func() error {
+			_, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Atespace: bad, Name: "job"})
+			return err
+		},
+		"DeleteTask": func() error {
+			_, err := srv.DeleteTask(ctx, &v1alpha1.DeleteTaskRequest{Name: bad})
+			return err
+		},
+		"SuspendTask": func() error {
+			_, err := srv.SuspendTask(ctx, &v1alpha1.SuspendTaskRequest{Name: bad})
+			return err
+		},
+		"ResumeTask": func() error {
+			_, err := srv.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Name: bad})
+			return err
+		},
+		"ListTasks": func() error {
+			_, err := srv.ListTasks(ctx, &v1alpha1.ListTasksRequest{Atespace: bad})
+			return err
+		},
+	}
+	for name, call := range calls {
+		if err := call(); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("%s: expected InvalidArgument for a name with a quote, got %v", name, err)
+		}
+	}
+}
+
+// A listing walks visibility on the caller's behalf, so the page it asks for
+// is capped whatever the caller asked.
+func TestListTasksCapsTheLimit(t *testing.T) {
+	tasks := newFakeTasks()
+	srv := server.NewServer(memory.NewStore(), tasks, server.Options{})
+
+	if _, err := srv.ListTasks(context.Background(), &v1alpha1.ListTasksRequest{Limit: 1_000_000}); err != nil {
+		t.Fatalf("ListTasks failed: %v", err)
+	}
+	if tasks.lastLimit <= 0 || tasks.lastLimit >= 1_000_000 {
+		t.Errorf("expected the limit to be capped, got %d", tasks.lastLimit)
+	}
+}
+
 // A name or atespace ends up in Substrate resource names, in HTTP headers, and
 // in the queries the control plane builds, so the API rejects anything that is
 // not a DNS label, for every kind alike.

@@ -38,6 +38,11 @@ type fakeTasks struct {
 	applied []*workflows.TaskDesiredState
 	// ready, when set, marks a task Ready as soon as it is applied.
 	ready bool
+	// unavailableGets is how many Gets in a row answer as if no worker were
+	// there, which is what a controller restart looks like to the server.
+	unavailableGets int
+	// lastLimit records the limit the server asked a listing for.
+	lastLimit int64
 }
 
 func newFakeTasks() *fakeTasks {
@@ -79,6 +84,10 @@ func (f *fakeTasks) Apply(ctx context.Context, desired *workflows.TaskDesiredSta
 func (f *fakeTasks) Get(ctx context.Context, atespace, name string) (*v1alpha1.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.unavailableGets > 0 {
+		f.unavailableGets--
+		return nil, orchestration.ErrTaskUnavailable
+	}
 	task, ok := f.tasks[fakeKey(atespace, name)]
 	if !ok {
 		return nil, orchestration.ErrTaskNotFound
@@ -86,9 +95,17 @@ func (f *fakeTasks) Get(ctx context.Context, atespace, name string) (*v1alpha1.T
 	return proto.Clone(task).(*v1alpha1.Task), nil
 }
 
+// workerAway makes the next n Gets answer as if no worker were there.
+func (f *fakeTasks) workerAway(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unavailableGets = n
+}
+
 func (f *fakeTasks) List(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastLimit = limit
 
 	keys := make([]string, 0, len(f.tasks))
 	for k := range f.tasks {
