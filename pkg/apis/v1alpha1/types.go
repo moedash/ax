@@ -306,6 +306,12 @@ func (s *TaskSpec) WorkspacePaths() []string {
 // maxLabelLength is the longest an RFC 1123 DNS label may be.
 const maxLabelLength = 63
 
+// MaxTaskNameLength is the longest a task name may be. A task's actor template
+// is named after the task with a suffix of fourteen characters, "-tmpl-" and
+// eight hex digits, and Substrate resource names are DNS labels, so the suffix
+// comes out of the task name's budget.
+const MaxTaskNameLength = maxLabelLength - 14
+
 // dnsLabel matches an RFC 1123 DNS label: lower case letters, digits, and
 // dashes, starting and ending with a letter or a digit.
 var dnsLabel = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
@@ -322,14 +328,21 @@ func ValidateMetadata(meta *ObjectMeta) error {
 		return fmt.Errorf("metadata.name is required")
 	}
 	if len(name) > maxLabelLength || !dnsLabel.MatchString(name) {
-		return fmt.Errorf("metadata.name %q must be a DNS label: lower case letters, digits, and dashes, at most %d characters", name, maxLabelLength)
+		return fmt.Errorf("metadata.name %q must be a DNS label: "+
+			"lower case letters, digits, and dashes, at most %d characters", name, maxLabelLength)
 	}
-	atespace := meta.GetAtespace()
-	if atespace == "" {
+	if meta.GetAtespace() == "" {
 		return nil
 	}
+	return ValidateAtespace(meta.GetAtespace())
+}
+
+// ValidateAtespace reports whether an atespace can be used as one: it has to
+// be a DNS label for the same reasons a name does.
+func ValidateAtespace(atespace string) error {
 	if len(atespace) > maxLabelLength || !dnsLabel.MatchString(atespace) {
-		return fmt.Errorf("metadata.atespace %q must be a DNS label: lower case letters, digits, and dashes, at most %d characters", atespace, maxLabelLength)
+		return fmt.Errorf("metadata.atespace %q must be a DNS label: "+
+			"lower case letters, digits, and dashes, at most %d characters", atespace, maxLabelLength)
 	}
 	return nil
 }
@@ -339,6 +352,10 @@ func ValidateMetadata(meta *ObjectMeta) error {
 func ValidateTask(t *Task) error {
 	if err := ValidateMetadata(t.GetMetadata()); err != nil {
 		return err
+	}
+	if name := t.GetMetadata().GetName(); len(name) > MaxTaskNameLength {
+		return fmt.Errorf("metadata.name %q is too long: a task name is at most %d characters, "+
+			"so that its actor template name fits a DNS label", name, MaxTaskNameLength)
 	}
 	spec := t.GetSpec()
 	if spec == nil {

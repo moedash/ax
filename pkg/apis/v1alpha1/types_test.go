@@ -501,6 +501,29 @@ spec:
 	}
 }
 
+// A task name has to leave room for the actor template suffix inside a DNS
+// label, so it is shorter than the names of the other kinds.
+func TestValidateTaskCapsTheName(t *testing.T) {
+	longest := strings.Repeat("a", v1alpha1.MaxTaskNameLength)
+	if err := v1alpha1.ValidateTask(&v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: longest},
+	}); err != nil {
+		t.Errorf("expected the longest allowed name to be accepted, got %v", err)
+	}
+
+	err := v1alpha1.ValidateTask(&v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: longest + "a"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Errorf("expected a name one over the cap to be refused, got %v", err)
+	}
+
+	// The cap is a task thing; a gateway may use the whole label.
+	if err := v1alpha1.ValidateMetadata(&v1alpha1.ObjectMeta{Name: longest + "a"}); err != nil {
+		t.Errorf("expected the other kinds to keep the DNS label limit, got %v", err)
+	}
+}
+
 func TestValidateMetadata(t *testing.T) {
 	tests := []struct {
 		name    string

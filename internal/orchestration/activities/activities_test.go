@@ -230,6 +230,20 @@ func TestActorTemplateCarriesTheRunnerEnvironment(t *testing.T) {
 	}
 }
 
+// Substrate names are DNS labels. The longest task name the API accepts has to
+// yield a template name that still fits one.
+func TestTaskTemplateNameFitsADNSLabel(t *testing.T) {
+	task := testTask()
+	task.Metadata.Name = strings.Repeat("a", v1alpha1.MaxTaskNameLength)
+	name := activities.TaskTemplateName(task, nil, 0)
+	if len(name) != 63 {
+		t.Errorf("expected the longest task name to fill a DNS label exactly, got %d: %q", len(name), name)
+	}
+	if !activities.TaskTemplatePattern(task.Metadata.Name).MatchString(name) {
+		t.Errorf("expected the deletion pattern to match %q", name)
+	}
+}
+
 // A template name is stable for one desired state and different for another.
 func TestTaskTemplateNameTracksTheDesiredState(t *testing.T) {
 	task := testTask()
