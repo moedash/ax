@@ -88,7 +88,8 @@ func Start(s *ControlServer) (*substrate.Client, func(), error) {
 	ateapipb.RegisterControlServer(grpcServer, s)
 	go func() { _ = grpcServer.Serve(lis) }()
 
-	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	client, err := substrate.NewClient(lis.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		grpcServer.Stop()
 		return nil, nil, err
@@ -137,13 +138,19 @@ func (s *ControlServer) record(list *[]string, name string) {
 
 // Control API implementation.
 
-func (s *ControlServer) CreateAtespace(ctx context.Context, req *ateapipb.CreateAtespaceRequest) (*ateapipb.Atespace, error) {
+func (s *ControlServer) CreateAtespace(
+	ctx context.Context,
+	req *ateapipb.CreateAtespaceRequest,
+) (*ateapipb.Atespace, error) {
 	name := req.GetAtespace().GetMetadata().GetName()
 	s.record(&s.atespaces, name)
 	return &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }
 
-func (s *ControlServer) CreateActor(ctx context.Context, req *ateapipb.CreateActorRequest) (*ateapipb.Actor, error) {
+func (s *ControlServer) CreateActor(
+	ctx context.Context,
+	req *ateapipb.CreateActorRequest,
+) (*ateapipb.Actor, error) {
 	s.mu.Lock()
 	failure := s.CreateActorErr
 	s.mu.Unlock()
@@ -170,7 +177,10 @@ func (s *ControlServer) CreateActor(ctx context.Context, req *ateapipb.CreateAct
 	}, nil
 }
 
-func (s *ControlServer) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
+func (s *ControlServer) ResumeActor(
+	ctx context.Context,
+	req *ateapipb.ResumeActorRequest,
+) (*ateapipb.ResumeActorResponse, error) {
 	s.mu.Lock()
 	failure, workerIP := s.ResumeErr, s.WorkerIP
 	s.mu.Unlock()
@@ -197,7 +207,10 @@ func (s *ControlServer) ResumeActor(ctx context.Context, req *ateapipb.ResumeAct
 	}, nil
 }
 
-func (s *ControlServer) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
+func (s *ControlServer) SuspendActor(
+	ctx context.Context,
+	req *ateapipb.SuspendActorRequest,
+) (*ateapipb.SuspendActorResponse, error) {
 	name := req.GetActor().GetName()
 	s.mu.Lock()
 	s.suspended = append(s.suspended, name)
@@ -214,7 +227,10 @@ func (s *ControlServer) SetActorState(name string, state ateapipb.ActorState) {
 	s.actorState[name] = state
 }
 
-func (s *ControlServer) GetActor(ctx context.Context, req *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
+func (s *ControlServer) GetActor(
+	ctx context.Context,
+	req *ateapipb.GetActorRequest,
+) (*ateapipb.Actor, error) {
 	name := req.GetActor().GetName()
 	s.mu.Lock()
 	state, ok := s.actorState[name]
@@ -238,17 +254,26 @@ func (s *ControlServer) GetActor(ctx context.Context, req *ateapipb.GetActorRequ
 	return actor, nil
 }
 
-func (s *ControlServer) CreateActorEgressPolicy(ctx context.Context, req *ateapipb.CreateActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
+func (s *ControlServer) CreateActorEgressPolicy(
+	ctx context.Context,
+	req *ateapipb.CreateActorEgressPolicyRequest,
+) (*ateapipb.EgressPolicy, error) {
 	s.record(&s.policies, req.GetActor().GetName())
 	return &ateapipb.EgressPolicy{}, nil
 }
 
-func (s *ControlServer) DeleteActorEgressPolicy(ctx context.Context, req *ateapipb.DeleteActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
+func (s *ControlServer) DeleteActorEgressPolicy(
+	ctx context.Context,
+	req *ateapipb.DeleteActorEgressPolicyRequest,
+) (*ateapipb.EgressPolicy, error) {
 	s.record(&s.delPolicy, req.GetActor().GetName())
 	return &ateapipb.EgressPolicy{}, nil
 }
 
-func (s *ControlServer) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorRequest) (*ateapipb.Actor, error) {
+func (s *ControlServer) DeleteActor(
+	ctx context.Context,
+	req *ateapipb.DeleteActorRequest,
+) (*ateapipb.Actor, error) {
 	name := req.GetActor().GetName()
 	s.mu.Lock()
 	s.delActors = append(s.delActors, name)
@@ -258,7 +283,10 @@ func (s *ControlServer) DeleteActor(ctx context.Context, req *ateapipb.DeleteAct
 	return &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }
 
-func (s *ControlServer) GetActorTemplate(ctx context.Context, req *ateapipb.GetActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+func (s *ControlServer) GetActorTemplate(
+	ctx context.Context,
+	req *ateapipb.GetActorTemplateRequest,
+) (*ateapipb.ActorTemplate, error) {
 	name := req.GetActorTemplate().GetName()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -270,7 +298,10 @@ func (s *ControlServer) GetActorTemplate(ctx context.Context, req *ateapipb.GetA
 	}, nil
 }
 
-func (s *ControlServer) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+func (s *ControlServer) CreateActorTemplate(
+	ctx context.Context,
+	req *ateapipb.CreateActorTemplateRequest,
+) (*ateapipb.ActorTemplate, error) {
 	tmpl := req.GetActorTemplate()
 	name := tmpl.GetMetadata().GetName()
 	env := make(map[string]string)
@@ -287,7 +318,10 @@ func (s *ControlServer) CreateActorTemplate(ctx context.Context, req *ateapipb.C
 	return tmpl, nil
 }
 
-func (s *ControlServer) ListActorTemplates(ctx context.Context, req *ateapipb.ListActorTemplatesRequest) (*ateapipb.ListActorTemplatesResponse, error) {
+func (s *ControlServer) ListActorTemplates(
+	ctx context.Context,
+	req *ateapipb.ListActorTemplatesRequest,
+) (*ateapipb.ListActorTemplatesResponse, error) {
 	resp := &ateapipb.ListActorTemplatesResponse{}
 	for _, name := range s.Templates() {
 		resp.ActorTemplates = append(resp.ActorTemplates, &ateapipb.ActorTemplate{
@@ -297,7 +331,10 @@ func (s *ControlServer) ListActorTemplates(ctx context.Context, req *ateapipb.Li
 	return resp, nil
 }
 
-func (s *ControlServer) DeleteActorTemplate(ctx context.Context, req *ateapipb.DeleteActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+func (s *ControlServer) DeleteActorTemplate(
+	ctx context.Context,
+	req *ateapipb.DeleteActorTemplateRequest,
+) (*ateapipb.ActorTemplate, error) {
 	name := req.GetActorTemplate().GetName()
 	s.mu.Lock()
 	defer s.mu.Unlock()

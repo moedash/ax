@@ -199,7 +199,12 @@ func reportCommandExit(exit runner.CommandExit) {
 		in.Generation = generation
 	}
 
-	r := exitReporter{client: c, workflowID: workflowID, updateWait: updateWait, signalWait: signalWait}
+	r := exitReporter{
+		client:     c,
+		workflowID: workflowID,
+		updateWait: updateWait,
+		signalWait: signalWait,
+	}
 	if err := r.report(in); err != nil {
 		slog.Error("could not report the task command exit", "workflow", workflowID, "error", err)
 		return

@@ -56,7 +56,10 @@ func fakeKey(atespace, name string) string {
 	return fmt.Sprintf("%s/%s", atespace, name)
 }
 
-func (f *fakeTasks) Apply(ctx context.Context, desired *workflows.TaskDesiredState) (*v1alpha1.Task, error) {
+func (f *fakeTasks) Apply(
+	ctx context.Context,
+	desired *workflows.TaskDesiredState,
+) (*v1alpha1.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -102,7 +105,11 @@ func (f *fakeTasks) workerAway(n int) {
 	f.unavailableGets = n
 }
 
-func (f *fakeTasks) List(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error) {
+func (f *fakeTasks) List(
+	ctx context.Context,
+	atespace string,
+	limit, offset int64,
+) ([]*v1alpha1.Task, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastLimit = limit

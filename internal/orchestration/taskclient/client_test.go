@@ -73,18 +73,28 @@ type fakeTemporal struct {
 	listQueries []string
 }
 
-func (f *fakeTemporal) NewWithStartWorkflowOperation(options sdkclient.StartWorkflowOptions, workflow any, args ...any) sdkclient.WithStartWorkflowOperation {
+func (f *fakeTemporal) NewWithStartWorkflowOperation(
+	options sdkclient.StartWorkflowOptions,
+	workflow any,
+	args ...any,
+) sdkclient.WithStartWorkflowOperation {
 	f.startOptions = options
 	f.startWorkflow = workflow
 	return nil
 }
 
-func (f *fakeTemporal) UpdateWithStartWorkflow(ctx context.Context, options sdkclient.UpdateWithStartWorkflowOptions) (sdkclient.WorkflowUpdateHandle, error) {
+func (f *fakeTemporal) UpdateWithStartWorkflow(
+	ctx context.Context,
+	options sdkclient.UpdateWithStartWorkflowOptions,
+) (sdkclient.WorkflowUpdateHandle, error) {
 	f.updateOptions = options.UpdateOptions
 	return f.answerUpdate(ctx)
 }
 
-func (f *fakeTemporal) UpdateWorkflow(ctx context.Context, options sdkclient.UpdateWorkflowOptions) (sdkclient.WorkflowUpdateHandle, error) {
+func (f *fakeTemporal) UpdateWorkflow(
+	ctx context.Context,
+	options sdkclient.UpdateWorkflowOptions,
+) (sdkclient.WorkflowUpdateHandle, error) {
 	f.updateOptions = options
 	return f.answerUpdate(ctx)
 }
@@ -117,7 +127,10 @@ func (f *fakeTemporal) QueryWorkflowWithOptions(
 	}, nil
 }
 
-func (f *fakeTemporal) DescribeWorkflowExecution(ctx context.Context, workflowID, runID string) (*workflowservice.DescribeWorkflowExecutionResponse, error) {
+func (f *fakeTemporal) DescribeWorkflowExecution(
+	ctx context.Context,
+	workflowID, runID string,
+) (*workflowservice.DescribeWorkflowExecutionResponse, error) {
 	f.describes++
 	if f.describeErr != nil {
 		return nil, f.describeErr
@@ -127,7 +140,10 @@ func (f *fakeTemporal) DescribeWorkflowExecution(ctx context.Context, workflowID
 	}, nil
 }
 
-func (f *fakeTemporal) ListWorkflow(ctx context.Context, request *workflowservice.ListWorkflowExecutionsRequest) (*workflowservice.ListWorkflowExecutionsResponse, error) {
+func (f *fakeTemporal) ListWorkflow(
+	ctx context.Context,
+	request *workflowservice.ListWorkflowExecutionsRequest,
+) (*workflowservice.ListWorkflowExecutionsResponse, error) {
 	f.listQueries = append(f.listQueries, request.GetQuery())
 	resp := &workflowservice.ListWorkflowExecutionsResponse{}
 	for _, execution := range f.executions {
@@ -255,11 +271,13 @@ func TestApplySendsTheUpdateWithAStart(t *testing.T) {
 	if got := fake.startOptions.TaskQueue; got != "ax-tasks" {
 		t.Errorf("expected task queue ax-tasks, got %q", got)
 	}
-	if got := fake.startOptions.WorkflowIDConflictPolicy; got != enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING {
-		t.Errorf("a running task has to take the update, got conflict policy %v", got)
+	conflict := fake.startOptions.WorkflowIDConflictPolicy
+	if conflict != enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING {
+		t.Errorf("a running task has to take the update, got conflict policy %v", conflict)
 	}
-	if got := fake.startOptions.WorkflowIDReusePolicy; got != enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE {
-		t.Errorf("a deleted task has to be creatable again, got reuse policy %v", got)
+	reuse := fake.startOptions.WorkflowIDReusePolicy
+	if reuse != enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE {
+		t.Errorf("a deleted task has to be creatable again, got reuse policy %v", reuse)
 	}
 	if got := fake.startWorkflow; got != workflows.TaskWorkflowType {
 		t.Errorf("expected the workflow type, got %v", got)
@@ -407,7 +425,8 @@ func TestGetMapsAMissingWorkflowToNotFound(t *testing.T) {
 // the shape of "worker may be down".
 func TestGetMapsNoPollerToUnavailable(t *testing.T) {
 	client := newTestClient(&fakeTemporal{
-		queryErr: serviceerror.NewFailedPrecondition("no poller seen for task queue recently, worker may be down"),
+		queryErr: serviceerror.NewFailedPrecondition(
+			"no poller seen for task queue recently, worker may be down"),
 	})
 
 	_, err := client.Get(context.Background(), "team-a", "job")
@@ -450,7 +469,8 @@ func TestSuspendAnswersWithTheTask(t *testing.T) {
 // it whatever validation upstream does.
 func TestListQuery(t *testing.T) {
 	all := listQuery("")
-	if !strings.Contains(all, "WorkflowType = 'TaskWorkflow'") || !strings.Contains(all, "ExecutionStatus = 'Running'") {
+	if !strings.Contains(all, "WorkflowType = 'TaskWorkflow'") ||
+		!strings.Contains(all, "ExecutionStatus = 'Running'") {
 		t.Errorf("unexpected query for every atespace: %q", all)
 	}
 	if strings.Contains(all, workflows.AtespaceSearchAttribute) {
@@ -496,7 +516,8 @@ func TestListReadsVisibilityWithoutAskingEachTask(t *testing.T) {
 		t.Errorf("expected the task's identity, got %v", first.GetMetadata())
 	}
 	if first.GetMetadata().GetCreationTimestamp().AsTime() != started {
-		t.Errorf("expected the start time as the creation time, got %v", first.GetMetadata().GetCreationTimestamp())
+		t.Errorf("expected the start time as the creation time, got %v",
+			first.GetMetadata().GetCreationTimestamp())
 	}
 	if first.GetStatus().GetPhase() != v1alpha1.PhaseRunning {
 		t.Errorf("expected the published phase, got %q", first.GetStatus().GetPhase())

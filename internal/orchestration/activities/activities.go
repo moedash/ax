@@ -200,7 +200,10 @@ func (a *Activities) EnsureAtespace(ctx context.Context, in AtespaceInput) error
 // The template carries the container image and the environment the runner needs:
 // the task and workspace specs, the model credentials, and the address of the
 // task workflow.
-func (a *Activities) EnsureActorTemplate(ctx context.Context, in TemplateInput) (TemplateProvision, error) {
+func (a *Activities) EnsureActorTemplate(
+	ctx context.Context,
+	in TemplateInput,
+) (TemplateProvision, error) {
 	if in.Template.Atespace == "" || in.Template.Name == "" {
 		return TemplateProvision{}, invalidSpec("template atespace and name are required")
 	}
@@ -251,12 +254,14 @@ func (a *Activities) EnsureActor(ctx context.Context, in ActorInput) (ActorProvi
 	if in.Actor.Name == "" || in.Template.Name == "" {
 		return ActorProvision{}, invalidSpec("actor name and template name are required")
 	}
-	activity.GetLogger(ctx).Info("ensuring actor", "actor", in.Actor.Name, "template", in.Template.Name)
+	activity.GetLogger(ctx).Info("ensuring actor",
+		"actor", in.Actor.Name, "template", in.Template.Name)
 
 	stop := heartbeatUntilDone(ctx)
 	defer stop()
 
-	actor, created, err := a.Substrate.EnsureActor(ctx, in.Actor.Atespace, in.Actor.Name, in.Template.Atespace, in.Template.Name)
+	actor, created, err := a.Substrate.EnsureActor(ctx, in.Actor.Atespace, in.Actor.Name,
+		in.Template.Atespace, in.Template.Name)
 	if err != nil {
 		return ActorProvision{}, classify(err)
 	}

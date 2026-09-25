@@ -74,13 +74,21 @@ func main() {
 		substratePlaintext   bool
 	)
 
-	flag.StringVar(&temporalAddress, "temporal-address", defaultTemporalAddress, "Temporal frontend address")
-	flag.StringVar(&temporalNamespace, "temporal-namespace", defaultTemporalNamespace, "Temporal namespace")
+	flag.StringVar(&temporalAddress, "temporal-address", defaultTemporalAddress,
+		"Temporal frontend address")
+	flag.StringVar(&temporalNamespace, "temporal-namespace", defaultTemporalNamespace,
+		"Temporal namespace")
 	flag.StringVar(&taskQueue, "task-queue", defaultTaskQueue, "Task queue this worker polls")
 	flag.DurationVar(&resyncInterval, "resync-interval", workflows.DefaultConfig().ResyncInterval,
-		"How often a settled task checks its sandbox against Substrate. Each interval costs one read per task.")
-	flag.BoolVar(&reportCompletion, "sandbox-report-completion", false, "Let task containers report their command's exit to their own workflow. This gives anything in a sandbox a route to the Temporal frontend, so it is only as safe as the frontend's authentication.")
-	flag.StringVar(&sandboxAddress, "sandbox-temporal-address", "", "Temporal address task containers dial to report their command's exit (defaults to --temporal-address)")
+		"How often a settled task checks its sandbox against Substrate. "+
+			"Each interval costs one read per task.")
+	flag.BoolVar(&reportCompletion, "sandbox-report-completion", false,
+		"Let task containers report their command's exit to their own workflow. "+
+			"This gives anything in a sandbox a route to the Temporal frontend, "+
+			"so it is only as safe as the frontend's authentication.")
+	flag.StringVar(&sandboxAddress, "sandbox-temporal-address", "",
+		"Temporal address task containers dial to report their command's exit "+
+			"(defaults to --temporal-address)")
 	flag.StringVar(&substrateEndpoint, "substrate-endpoint", "api.ate-system.svc.cluster.local:443", "Agent Substrate Control API endpoint")
 	flag.StringVar(&substrateAuthority, "substrate-authority", "api.ate-system.svc", "Authority / TLS ServerName for Substrate endpoint")
 	flag.StringVar(&substrateTokenFile, "substrate-token-file", "", "Path to bearer token file for Substrate auth")
@@ -149,7 +157,8 @@ func main() {
 	// namespace does not have fails the workflow task, so every task would loop
 	// without ever saying why; better to refuse to start and say it here.
 	verifyCtx, cancelVerify := context.WithTimeout(context.Background(), startupCheckTimeout)
-	err = taskclient.VerifySearchAttributes(verifyCtx, temporalClient.OperatorService(), temporalNamespace)
+	err = taskclient.VerifySearchAttributes(
+		verifyCtx, temporalClient.OperatorService(), temporalNamespace)
 	cancelVerify()
 	if err != nil {
 		slog.Error("the namespace is not ready for tasks", "error", err)

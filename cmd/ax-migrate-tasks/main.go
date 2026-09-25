@@ -50,8 +50,10 @@ func main() {
 		keep          bool
 		timeout       time.Duration
 	)
-	flag.StringVar(&serverAddr, "server", "localhost:8080", "Address of the ax-server that owns tasks now")
-	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server the old control plane used")
+	flag.StringVar(&serverAddr, "server", "localhost:8080",
+		"Address of the ax-server that owns tasks now")
+	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379",
+		"Redis server the old control plane used")
 	flag.StringVar(&redisPassword, "redis-password", "", "Redis password")
 	flag.StringVar(&keyPrefix, "key-prefix", "ax", "Key prefix the old control plane used")
 	flag.BoolVar(&keep, "keep", false, "Leave the Redis task keys in place after importing")
@@ -72,7 +74,8 @@ func main() {
 	defer conn.Close()
 
 	source := redisTasks{client: rClient, prefix: keyPrefix}
-	if err := migrate(context.Background(), source, v1alpha1.NewAXClient(conn), keep, timeout); err != nil {
+	api := v1alpha1.NewAXClient(conn)
+	if err := migrate(context.Background(), source, api, keep, timeout); err != nil {
 		slog.Error("migration did not finish", "error", err)
 		os.Exit(1)
 	}
@@ -164,7 +167,8 @@ func (r redisTasks) List(ctx context.Context) ([]*v1alpha1.Task, error) {
 			return nil, fmt.Errorf("reading task %s: %w", member, err)
 		}
 		var task v1alpha1.Task
-		if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal([]byte(raw), &task); err != nil {
+		unmarshal := protojson.UnmarshalOptions{DiscardUnknown: true}
+		if err := unmarshal.Unmarshal([]byte(raw), &task); err != nil {
 			return nil, fmt.Errorf("decoding task %s: %w", member, err)
 		}
 		tasks = append(tasks, &task)

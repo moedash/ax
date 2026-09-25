@@ -38,7 +38,10 @@ import (
 func noSecrets(context.Context, string, string, string) (string, error) { return "", nil }
 
 // newEnv wires the activities against a fake Control API.
-func newEnv(t *testing.T, control *substratetest.ControlServer) (*testsuite.TestActivityEnvironment, *activities.Activities) {
+func newEnv(
+	t *testing.T,
+	control *substratetest.ControlServer,
+) (*testsuite.TestActivityEnvironment, *activities.Activities) {
 	t.Helper()
 	client, stop, err := substratetest.Start(control)
 	if err != nil {
@@ -73,7 +76,8 @@ func TestProvisioningSequence(t *testing.T) {
 	control := substratetest.NewControlServer()
 	env, acts := newEnv(t, control)
 
-	if _, err := env.ExecuteActivity(acts.EnsureAtespace, activities.AtespaceInput{Atespace: "default"}); err != nil {
+	if _, err := env.ExecuteActivity(acts.EnsureAtespace,
+		activities.AtespaceInput{Atespace: "default"}); err != nil {
 		t.Fatalf("EnsureAtespace failed: %v", err)
 	}
 
@@ -121,7 +125,8 @@ func TestProvisioningSequence(t *testing.T) {
 	}
 
 	actor := activities.ActorRef{Atespace: "default", Name: "job"}
-	value, err = env.ExecuteActivity(acts.EnsureActor, activities.ActorInput{Actor: actor, Template: template})
+	value, err = env.ExecuteActivity(acts.EnsureActor,
+		activities.ActorInput{Actor: actor, Template: template})
 	if err != nil {
 		t.Fatalf("EnsureActor failed: %v", err)
 	}
@@ -136,8 +141,10 @@ func TestProvisioningSequence(t *testing.T) {
 		t.Errorf("expected the actor on template %v, got %v", template, placed.Template)
 	}
 	if _, err := env.ExecuteActivity(acts.ApplyEgressPolicy, activities.EgressInput{
-		Actor:     actor,
-		Allowlist: &v1alpha1.EgressAllowlist{Hosts: []*v1alpha1.HostRule{{Host: "github.com", Port: 443}}},
+		Actor: actor,
+		Allowlist: &v1alpha1.EgressAllowlist{
+			Hosts: []*v1alpha1.HostRule{{Host: "github.com", Port: 443}},
+		},
 	}); err != nil {
 		t.Fatalf("ApplyEgressPolicy failed: %v", err)
 	}
@@ -237,7 +244,8 @@ func TestTaskTemplateNameFitsADNSLabel(t *testing.T) {
 	task.Metadata.Name = strings.Repeat("a", v1alpha1.MaxTaskNameLength)
 	name := activities.TaskTemplateName(task, nil, 0)
 	if len(name) != 63 {
-		t.Errorf("expected the longest task name to fill a DNS label exactly, got %d: %q", len(name), name)
+		t.Errorf("expected the longest task name to fill a DNS label exactly, got %d: %q",
+			len(name), name)
 	}
 	if !activities.TaskTemplatePattern(task.Metadata.Name).MatchString(name) {
 		t.Errorf("expected the deletion pattern to match %q", name)
@@ -322,7 +330,8 @@ func TestTeardownRemovesTheActorAndItsTemplates(t *testing.T) {
 			t.Errorf("expected template %s to be deleted, got %v", want, control.DeletedTemplates())
 		}
 	}
-	for _, keep := range []string{"job-tmpl-deadbeef-tmpl-01234567", "jobs-tmpl-0a1b2c3d", "default-template"} {
+	kept := []string{"job-tmpl-deadbeef-tmpl-01234567", "jobs-tmpl-0a1b2c3d", "default-template"}
+	for _, keep := range kept {
 		if deleted[keep] {
 			t.Errorf("template %s should not have been deleted", keep)
 		}
@@ -583,7 +592,8 @@ func TestTemplateDeletionIsRetriedWhileTheActorHoldsIt(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("EnsureActorTemplate failed: %v", err)
 	}
-	if _, err := env.ExecuteActivity(acts.EnsureActor, activities.ActorInput{Actor: actor, Template: template}); err != nil {
+	if _, err := env.ExecuteActivity(acts.EnsureActor,
+		activities.ActorInput{Actor: actor, Template: template}); err != nil {
 		t.Fatalf("EnsureActor failed: %v", err)
 	}
 
@@ -648,39 +658,43 @@ func TestTaskTemplateNameCoversTheSpecFields(t *testing.T) {
 	base := testTask()
 	name := activities.TaskTemplateName(base, nil, 0)
 
-	changes := map[string]func(*v1alpha1.Task, []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace){
-		"command": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
+	// Each change edits the task in place and returns the workspaces it binds.
+	changes := map[string]func(task *v1alpha1.Task) []*v1alpha1.Workspace{
+		"command": func(task *v1alpha1.Task) []*v1alpha1.Workspace {
 			task.Spec.Command = []string{"/bin/other"}
-			return task, ws
+			return nil
 		},
-		"env value": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
+		"env value": func(task *v1alpha1.Task) []*v1alpha1.Workspace {
 			task.Spec.Env[0].Value = "something else"
-			return task, ws
+			return nil
 		},
-		"env name": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
+		"env name": func(task *v1alpha1.Task) []*v1alpha1.Workspace {
 			task.Spec.Env[0].Name = "OTHER"
-			return task, ws
+			return nil
 		},
-		"debug": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
+		"debug": func(task *v1alpha1.Task) []*v1alpha1.Workspace {
 			task.Spec.Debug = true
-			return task, ws
+			return nil
 		},
-		"workspace binding": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
+		"workspace binding": func(task *v1alpha1.Task) []*v1alpha1.Workspace {
 			task.Spec.Workspaces = []*v1alpha1.WorkspaceRef{{Name: "repo", Goal: "build it"}}
-			return task, ws
+			return nil
 		},
-		"workspace git": func(task *v1alpha1.Task, ws []*v1alpha1.Workspace) (*v1alpha1.Task, []*v1alpha1.Workspace) {
-			return task, []*v1alpha1.Workspace{{
+		"workspace git": func(task *v1alpha1.Task) []*v1alpha1.Workspace {
+			return []*v1alpha1.Workspace{{
 				Metadata: &v1alpha1.ObjectMeta{Name: "repo"},
 				Spec: &v1alpha1.WorkspaceSpec{
-					Git: []*v1alpha1.GitRepo{{Name: "repo", Repo: "https://github.com/example/repo", Branch: "main"}},
+					Git: []*v1alpha1.GitRepo{
+						{Name: "repo", Repo: "https://github.com/example/repo", Branch: "main"},
+					},
 				},
 			}}
 		},
 	}
 	for what, change := range changes {
 		t.Run(what, func(t *testing.T) {
-			task, workspaces := change(testTask(), nil)
+			task := testTask()
+			workspaces := change(task)
 			if got := activities.TaskTemplateName(task, workspaces, 0); got == name {
 				t.Errorf("a change to the %s must yield a new template name, both are %q", what, got)
 			}
@@ -734,7 +748,12 @@ func TestAwaitWorkspaceReadyResumesItsDeadline(t *testing.T) {
 	}
 }
 
-func runWorkspaceProbe(t *testing.T, env *testsuite.TestActivityEnvironment, acts *activities.Activities, in activities.WorkspaceReadyInput) bool {
+func runWorkspaceProbe(
+	t *testing.T,
+	env *testsuite.TestActivityEnvironment,
+	acts *activities.Activities,
+	in activities.WorkspaceReadyInput,
+) bool {
 	t.Helper()
 	value, err := env.ExecuteActivity(acts.AwaitWorkspaceReady, in)
 	if err != nil {

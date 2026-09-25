@@ -73,7 +73,10 @@ func New(c sdkclient.Client, taskQueue string) *Client {
 // Apply creates or updates a task. Creating and updating are the same call: the
 // update is sent together with a start, so a task that does not exist yet is
 // started and a task that is already running takes the update instead.
-func (c *Client) Apply(ctx context.Context, desired *workflows.TaskDesiredState) (*v1alpha1.Task, error) {
+func (c *Client) Apply(
+	ctx context.Context,
+	desired *workflows.TaskDesiredState,
+) (*v1alpha1.Task, error) {
 	if desired == nil || desired.Task.GetMetadata().GetName() == "" {
 		return nil, fmt.Errorf("%w: task name is required", orchestration.ErrInvalidTask)
 	}
@@ -182,11 +185,12 @@ func (c *Client) Get(ctx context.Context, atespace, name string) (*v1alpha1.Task
 	queryCtx, cancel := context.WithTimeout(ctx, c.queryWait)
 	defer cancel()
 
-	resp, err := c.client.QueryWorkflowWithOptions(queryCtx, &sdkclient.QueryWorkflowWithOptionsRequest{
+	request := &sdkclient.QueryWorkflowWithOptionsRequest{
 		WorkflowID:           workflowID,
 		QueryType:            workflows.QueryTask,
 		QueryRejectCondition: enumspb.QUERY_REJECT_CONDITION_NOT_OPEN,
-	})
+	}
+	resp, err := c.client.QueryWorkflowWithOptions(queryCtx, request)
 	if err != nil {
 		if timedOut(ctx, queryCtx) {
 			return nil, fmt.Errorf("%w: no worker answered for task %s",
@@ -208,7 +212,11 @@ func (c *Client) Get(ctx context.Context, atespace, name string) (*v1alpha1.Task
 // not cost a round trip to every task it lists, so the workflow publishes what
 // a listing shows and this reads it back. The worker address is the one thing
 // not carried there; GetTask has it.
-func (c *Client) List(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error) {
+func (c *Client) List(
+	ctx context.Context,
+	atespace string,
+	limit, offset int64,
+) ([]*v1alpha1.Task, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -286,11 +294,13 @@ func keyword(execution *workflowpb.WorkflowExecutionInfo, name string) string {
 // atespaces that are DNS labels, so the query cannot be steered by its input
 // whatever validation upstream does.
 func listQuery(atespace string) string {
-	query := fmt.Sprintf("WorkflowType = '%s' AND ExecutionStatus = 'Running'", workflows.TaskWorkflowType)
+	query := fmt.Sprintf("WorkflowType = '%s' AND ExecutionStatus = 'Running'",
+		workflows.TaskWorkflowType)
 	if atespace == "" || atespace == "*" {
 		return query
 	}
-	return query + fmt.Sprintf(" AND %s = %s", workflows.AtespaceSearchAttribute, quote(atespaceOf(atespace)))
+	return query + fmt.Sprintf(" AND %s = %s", workflows.AtespaceSearchAttribute,
+		quote(atespaceOf(atespace)))
 }
 
 // quote renders a value as a visibility query string literal.
@@ -299,7 +309,11 @@ func quote(value string) string {
 }
 
 // listExecutions walks visibility until it has at least want executions.
-func (c *Client) listExecutions(ctx context.Context, atespace string, want int64) ([]*workflowpb.WorkflowExecutionInfo, error) {
+func (c *Client) listExecutions(
+	ctx context.Context,
+	atespace string,
+	want int64,
+) ([]*workflowpb.WorkflowExecutionInfo, error) {
 	query := listQuery(atespace)
 
 	var (
@@ -336,7 +350,10 @@ func (c *Client) Resume(ctx context.Context, atespace, name string) (*v1alpha1.T
 // change sends an update that answers with the task. The wait is bounded, and a
 // task whose worker does not answer in that time is reported unavailable rather
 // than left hanging.
-func (c *Client) change(ctx context.Context, atespace, name, update string) (*v1alpha1.Task, error) {
+func (c *Client) change(
+	ctx context.Context,
+	atespace, name, update string,
+) (*v1alpha1.Task, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, c.changeWait)
 	defer cancel()
 
@@ -360,7 +377,8 @@ func (c *Client) change(ctx context.Context, atespace, name, update string) (*v1
 
 func (c *Client) changeError(ctx, waitCtx context.Context, atespace, name string, err error) error {
 	if timedOut(ctx, waitCtx) {
-		return fmt.Errorf("%w: no worker answered for task %s/%s", orchestration.ErrTaskUnavailable, atespaceOf(atespace), name)
+		return fmt.Errorf("%w: no worker answered for task %s/%s", orchestration.ErrTaskUnavailable,
+			atespaceOf(atespace), name)
 	}
 	return mapError(err)
 }

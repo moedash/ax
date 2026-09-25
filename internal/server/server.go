@@ -163,7 +163,8 @@ func (s *Server) UpdateTask(ctx context.Context, req *v1alpha1.UpdateTaskRequest
 	}
 	// A task that already exists keeps the creation time its workflow recorded,
 	// so nothing here has to read the task back first.
-	task.Metadata = defaultMetadata(task.Metadata, func(string, string) *v1alpha1.ObjectMeta { return nil })
+	task.Metadata = defaultMetadata(task.Metadata,
+		func(string, string) *v1alpha1.ObjectMeta { return nil })
 
 	desired, err := s.resolveTask(ctx, task)
 	if err != nil {
@@ -230,7 +231,8 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 // they are checked on every path that builds one, not only on the write.
 func taskRef(atespace, name string) (string, error) {
 	atespace = atespaceOf(atespace)
-	if err := v1alpha1.ValidateMetadata(&v1alpha1.ObjectMeta{Name: name, Atespace: atespace}); err != nil {
+	meta := &v1alpha1.ObjectMeta{Name: name, Atespace: atespace}
+	if err := v1alpha1.ValidateMetadata(meta); err != nil {
 		return "", status.Error(codes.InvalidArgument, err.Error())
 	}
 	return atespace, nil
@@ -319,7 +321,9 @@ func watchDone(task *v1alpha1.Task) bool {
 // that does not exist is left out rather than rejected: a task may be applied
 // before its configuration is, and the runner treats a missing workspace as an
 // empty directory.
-func (s *Server) resolveTask(ctx context.Context, task *v1alpha1.Task) (*workflows.TaskDesiredState, error) {
+func (s *Server) resolveTask(
+	ctx context.Context, task *v1alpha1.Task,
+) (*workflows.TaskDesiredState, error) {
 	atespace := task.GetMetadata().GetAtespace()
 	desired := &workflows.TaskDesiredState{Task: task}
 
@@ -329,7 +333,8 @@ func (s *Server) resolveTask(ctx context.Context, task *v1alpha1.Task) (*workflo
 		case err == nil:
 			desired.Gateway = gw
 		case errors.Is(err, store.ErrNotFound):
-			slog.Warn("task binds a gateway that does not exist", "task", task.GetMetadata().GetName(), "gateway", name)
+			slog.Warn("task binds a gateway that does not exist",
+				"task", task.GetMetadata().GetName(), "gateway", name)
 		default:
 			return nil, status.Errorf(codes.Internal, "reading gateway %q: %v", name, err)
 		}
@@ -344,7 +349,8 @@ func (s *Server) resolveTask(ctx context.Context, task *v1alpha1.Task) (*workflo
 		case err == nil:
 			desired.Workspaces = append(desired.Workspaces, ws)
 		case errors.Is(err, store.ErrNotFound):
-			slog.Warn("task binds a workspace that does not exist", "task", task.GetMetadata().GetName(), "workspace", ref.GetName())
+			slog.Warn("task binds a workspace that does not exist",
+				"task", task.GetMetadata().GetName(), "workspace", ref.GetName())
 		default:
 			return nil, status.Errorf(codes.Internal, "reading workspace %q: %v", ref.GetName(), err)
 		}

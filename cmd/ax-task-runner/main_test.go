@@ -122,7 +122,12 @@ func TestReportDoesNotSignalARefusedUpdate(t *testing.T) {
 	fake := &fakeControlPlane{
 		updateErr: temporal.NewApplicationError("replaced", workflows.ErrTypeStaleReport),
 	}
-	r := exitReporter{client: fake, workflowID: "default/job", updateWait: time.Second, signalWait: time.Second}
+	r := exitReporter{
+		client:     fake,
+		workflowID: "default/job",
+		updateWait: time.Second,
+		signalWait: time.Second,
+	}
 
 	if err := r.report(workflows.CompleteInput{ExitCode: 0}); err == nil {
 		t.Fatal("expected the refusal to be reported")

@@ -89,7 +89,8 @@ func serveAPI(t *testing.T, tasks orchestration.Tasks) v1alpha1.AXClient {
 	go func() { _ = httpServer.Serve(ln) }()
 	t.Cleanup(func() { _ = httpServer.Close() })
 
-	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(ln.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to dial: %v", err)
 	}

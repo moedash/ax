@@ -533,7 +533,11 @@ func TestValidateMetadata(t *testing.T) {
 		{name: "name and atespace", meta: &v1alpha1.ObjectMeta{Name: "task-1", Atespace: "team-a"}},
 		{name: "atespace defaulted later", meta: &v1alpha1.ObjectMeta{Name: "task-1"}},
 		{name: "no metadata", wantErr: "metadata.name is required"},
-		{name: "no name", meta: &v1alpha1.ObjectMeta{Atespace: "default"}, wantErr: "metadata.name is required"},
+		{
+			name:    "no name",
+			meta:    &v1alpha1.ObjectMeta{Atespace: "default"},
+			wantErr: "metadata.name is required",
+		},
 		{
 			name:    "quote in name",
 			meta:    &v1alpha1.ObjectMeta{Name: "task' OR '1'='1"},

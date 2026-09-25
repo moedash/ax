@@ -85,7 +85,10 @@ func (r *taskRun) queryStatus() (*v1alpha1.TaskStatus, error) {
 // handleApply replaces the task's desired state and answers with the task as it
 // stands once the change has been driven into Substrate. Creating a task is the
 // same operation, sent together with the workflow start.
-func (r *taskRun) handleApply(ctx workflow.Context, desired *TaskDesiredState) (*v1alpha1.Task, error) {
+func (r *taskRun) handleApply(
+	ctx workflow.Context,
+	desired *TaskDesiredState,
+) (*v1alpha1.Task, error) {
 	if err := r.adopt(ctx, desired); err != nil {
 		return nil, err
 	}
@@ -158,7 +161,10 @@ func (r *taskRun) validateRunning(ctx workflow.Context) error {
 
 // handleComplete records how the task command exited. Nothing has to be driven
 // into Substrate, so the report is answered as soon as it is recorded.
-func (r *taskRun) handleComplete(ctx workflow.Context, in CompleteInput) (*v1alpha1.TaskStatus, error) {
+func (r *taskRun) handleComplete(
+	ctx workflow.Context,
+	in CompleteInput,
+) (*v1alpha1.TaskStatus, error) {
 	r.recordCompletion(ctx, in)
 	return r.statusSnapshot(), nil
 }

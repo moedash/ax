@@ -58,12 +58,17 @@ func main() {
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
-	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address for the configuration kinds")
+	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379",
+		"Redis server address for the configuration kinds")
 	flag.StringVar(&redisPassword, "redis-password", "", "Redis password")
-	flag.StringVar(&temporalAddress, "temporal-address", defaultTemporalAddress, "Temporal frontend address")
-	flag.StringVar(&temporalNamespace, "temporal-namespace", defaultTemporalNamespace, "Temporal namespace")
-	flag.StringVar(&taskQueue, "task-queue", defaultTaskQueue, "Task queue task workflows are started on")
-	flag.DurationVar(&watchInterval, "watch-interval", 2*time.Second, "How often WatchTask asks a task for its state. Each interval is one query per open watch.")
+	flag.StringVar(&temporalAddress, "temporal-address", defaultTemporalAddress,
+		"Temporal frontend address")
+	flag.StringVar(&temporalNamespace, "temporal-namespace", defaultTemporalNamespace,
+		"Temporal namespace")
+	flag.StringVar(&taskQueue, "task-queue", defaultTaskQueue,
+		"Task queue task workflows are started on")
+	flag.DurationVar(&watchInterval, "watch-interval", 2*time.Second,
+		"How often WatchTask asks a task for its state. Each interval is one query per open watch.")
 	flag.Parse()
 
 	if env := os.Getenv("ADDR"); env != "" {
@@ -116,7 +121,8 @@ func main() {
 	// Listing tasks reads the search attributes a task publishes. Without them
 	// every listing fails, so the server refuses to start and says what to run.
 	verifyCtx, cancelVerify := context.WithTimeout(context.Background(), startupCheckTimeout)
-	err = taskclient.VerifySearchAttributes(verifyCtx, temporalClient.OperatorService(), temporalNamespace)
+	err = taskclient.VerifySearchAttributes(
+		verifyCtx, temporalClient.OperatorService(), temporalNamespace)
 	cancelVerify()
 	if err != nil {
 		slog.Error("the namespace is not ready for tasks", "error", err)

@@ -133,7 +133,12 @@ func (s *taskWorkflowSuite) SetupTest() {
 // updateTask sends an update and captures the task its handler answered with.
 // Reading state through an update is deterministic: the handler only returns
 // once the change has been driven into Substrate.
-func (s *taskWorkflowSuite) updateTask(at time.Duration, name, id string, got **v1alpha1.Task, args ...any) {
+func (s *taskWorkflowSuite) updateTask(
+	at time.Duration,
+	name, id string,
+	got **v1alpha1.Task,
+	args ...any,
+) {
 	s.env.RegisterDelayedCallback(func() {
 		s.env.UpdateWorkflow(name, id, &testsuite.TestUpdateCallback{
 			OnReject: func(err error) { s.Failf("update rejected", "%s: %v", name, err) },
@@ -149,7 +154,12 @@ func (s *taskWorkflowSuite) updateTask(at time.Duration, name, id string, got **
 }
 
 // updateStatus is updateTask for the handlers that answer with a status.
-func (s *taskWorkflowSuite) updateStatus(at time.Duration, name, id string, got **v1alpha1.TaskStatus, args ...any) {
+func (s *taskWorkflowSuite) updateStatus(
+	at time.Duration,
+	name, id string,
+	got **v1alpha1.TaskStatus,
+	args ...any,
+) {
 	s.env.RegisterDelayedCallback(func() {
 		s.env.UpdateWorkflow(name, id, &testsuite.TestUpdateCallback{
 			OnReject: func(err error) { s.Failf("update rejected", "%s: %v", name, err) },
@@ -406,8 +416,10 @@ func (s *taskWorkflowSuite) TestProvisionsAndRuns() {
 	s.Equal("10.244.1.42", running.GetWorkerIp())
 	s.Nil(running.ExitCode)
 	assertCondition(s.T(), running, v1alpha1.ConditionReady, v1alpha1.ConditionTrue, "TaskRunning")
-	assertCondition(s.T(), running, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue, "SetupComplete")
-	assertCondition(s.T(), running, v1alpha1.ConditionGatewayReady, v1alpha1.ConditionTrue, "PoliciesApplied")
+	assertCondition(s.T(), running, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue,
+		"SetupComplete")
+	assertCondition(s.T(), running, v1alpha1.ConditionGatewayReady, v1alpha1.ConditionTrue,
+		"PoliciesApplied")
 
 	// Deleting the task releases the sandbox and then its templates.
 	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.delActors))
@@ -452,7 +464,8 @@ func (s *taskWorkflowSuite) TestActorFailureRollsBackProvisioning() {
 
 	s.Require().NotNil(failed)
 	s.Equal(v1alpha1.PhaseFailed, failed.GetStatus().GetPhase())
-	assertCondition(s.T(), failed.GetStatus(), v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "ActorCreationFailed")
+	assertCondition(s.T(), failed.GetStatus(), v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+		"ActorCreationFailed")
 }
 
 // A task bound to a gateway must not run without the gateway's allowlist.
@@ -473,7 +486,8 @@ func (s *taskWorkflowSuite) TestEgressFailureRollsBackARestrictedTask() {
 
 	s.Require().NotNil(failed)
 	s.Equal(v1alpha1.PhaseFailed, failed.GetStatus().GetPhase())
-	assertCondition(s.T(), failed.GetStatus(), v1alpha1.ConditionGatewayReady, v1alpha1.ConditionFalse, "PolicyApplyFailed")
+	assertCondition(s.T(), failed.GetStatus(), v1alpha1.ConditionGatewayReady, v1alpha1.ConditionFalse,
+		"PolicyApplyFailed")
 }
 
 // Without a gateway a task keeps unrestricted egress, so a failure to apply the
@@ -496,7 +510,8 @@ func (s *taskWorkflowSuite) TestEgressFailureIsToleratedWithoutAGateway() {
 	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.resumes))
 	s.Require().NotNil(applied)
 	s.Equal(v1alpha1.PhaseRunning, applied.GetStatus().GetPhase())
-	assertCondition(s.T(), applied.GetStatus(), v1alpha1.ConditionGatewayReady, v1alpha1.ConditionFalse, "PolicyApplyFailed")
+	assertCondition(s.T(), applied.GetStatus(), v1alpha1.ConditionGatewayReady,
+		v1alpha1.ConditionFalse, "PolicyApplyFailed")
 }
 
 func (s *taskWorkflowSuite) TestSuspendAndResume() {
@@ -519,9 +534,11 @@ func (s *taskWorkflowSuite) TestSuspendAndResume() {
 	s.Equal(v1alpha1.PhaseSuspended, suspended.GetPhase())
 	s.Empty(suspended.GetWorkerIp())
 	s.True(suspendedTask.GetSpec().GetSuspend())
-	assertCondition(s.T(), suspended, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TaskSuspended")
+	assertCondition(s.T(), suspended, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+		"TaskSuspended")
 	// Workspace setup is a one-time step whose result outlives a suspend.
-	assertCondition(s.T(), suspended, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue, "SetupComplete")
+	assertCondition(s.T(), suspended, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue,
+		"SetupComplete")
 
 	s.Require().NotNil(resumedTask)
 	resumed := resumedTask.GetStatus()
@@ -550,7 +567,8 @@ func (s *taskWorkflowSuite) TestCompleteRecordsTheExitCode() {
 	s.Equal(v1alpha1.PhaseCompleted, completed.GetPhase())
 	s.Require().NotNil(completed.ExitCode)
 	s.Equal(int32(3), completed.GetExitCode())
-	assertCondition(s.T(), completed, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "CommandExited")
+	assertCondition(s.T(), completed, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+		"CommandExited")
 	// The sandbox stays up after the command exits so its workspace can still be
 	// inspected.
 	s.Empty(deletedWhileCompleted)
@@ -707,7 +725,11 @@ func (s *taskWorkflowSuite) TestInvalidTaskIsRejected() {
 	s.Empty(s.calls.get(&s.calls.atespaces), "nothing is provisioned for a task that cannot run")
 }
 
-func assertCondition(t *testing.T, status *v1alpha1.TaskStatus, condType, wantStatus, wantReason string) {
+func assertCondition(
+	t *testing.T,
+	status *v1alpha1.TaskStatus,
+	condType, wantStatus, wantReason string,
+) {
 	t.Helper()
 	for _, c := range status.GetConditions() {
 		if c.GetType() != condType {
@@ -747,12 +769,15 @@ func (s *taskWorkflowSuite) TestResyncRechecksAWorkspaceThatWasStillInitializing
 	s.Require().NoError(s.env.GetWorkflowError())
 
 	s.Require().NotNil(initializing)
-	assertCondition(s.T(), initializing, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionFalse, "Initializing")
-	assertCondition(s.T(), initializing, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "WorkspaceInitializing")
+	assertCondition(s.T(), initializing, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionFalse,
+		"Initializing")
+	assertCondition(s.T(), initializing, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+		"WorkspaceInitializing")
 
 	s.Len(s.calls.get(&s.calls.probes), 2, "the resync probes the workspace again")
 	s.Require().NotNil(ready)
-	assertCondition(s.T(), ready, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue, "SetupComplete")
+	assertCondition(s.T(), ready, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue,
+		"SetupComplete")
 	assertCondition(s.T(), ready, v1alpha1.ConditionReady, v1alpha1.ConditionTrue, "TaskRunning")
 	// The sandbox itself was never rebuilt.
 	s.Len(s.calls.get(&s.calls.actors), 1)
@@ -894,7 +919,8 @@ func (s *taskWorkflowSuite) TestAProbeForAReplacedSandboxIsDropped() {
 
 	s.Len(s.calls.get(&s.calls.probes), 2, "the replacement gets a probe of its own")
 	s.Require().NotNil(settled)
-	assertCondition(s.T(), settled, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue, "SetupComplete")
+	assertCondition(s.T(), settled, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue,
+		"SetupComplete")
 }
 
 // A task that continues as new answers the update it was given first.
@@ -922,7 +948,8 @@ func (s *taskWorkflowSuite) TestContinueAsNewKeepsABufferedCompletion() {
 	s.env.RegisterDelayedCallback(func() {
 		// Buffered without running workflow code, so it is still in the channel
 		// when the run is on its way out.
-		s.env.SignalWorkflowSkippingWorkflowTask(workflows.SignalComplete, workflows.CompleteInput{ExitCode: 9})
+		s.env.SignalWorkflowSkippingWorkflowTask(workflows.SignalComplete,
+			workflows.CompleteInput{ExitCode: 9})
 		s.env.SignalWorkflow(workflows.SignalComplete, workflows.CompleteInput{ExitCode: 9})
 	}, 0)
 
@@ -978,7 +1005,8 @@ func (s *taskWorkflowSuite) TestATeardownThatFailsKeepsTheTask() {
 
 	s.Require().NotNil(stillThere)
 	s.Equal(v1alpha1.PhaseFailed, stillThere.GetPhase(), "the task stays, and says it could not go")
-	assertCondition(s.T(), stillThere, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TeardownFailed")
+	assertCondition(s.T(), stillThere, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+		"TeardownFailed")
 
 	s.Len(s.calls.get(&s.calls.delActors), 2, "the delete was tried again")
 	s.Equal([]string{"test-task"}, s.calls.get(&s.calls.delTmpl), "templates go once the actor has")
@@ -1112,7 +1140,8 @@ func (s *taskWorkflowSuite) TestChangesBeforeTheFirstApplyAreRejected() {
 	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, workflows.TaskWorkflowInput{})
 	s.True(s.env.IsWorkflowCompleted())
 
-	for _, update := range []string{workflows.UpdateSuspend, workflows.UpdateResume, workflows.UpdateComplete} {
+	early := []string{workflows.UpdateSuspend, workflows.UpdateResume, workflows.UpdateComplete}
+	for _, update := range early {
 		s.True(rejected[update], "%s before the first apply should be rejected", update)
 	}
 }
@@ -1120,7 +1149,8 @@ func (s *taskWorkflowSuite) TestChangesBeforeTheFirstApplyAreRejected() {
 // A delete does not wait for a pass that is still retrying its way to a
 // sandbox: the teardown starts as soon as the delete lands.
 func (s *taskWorkflowSuite) TestDeleteInterruptsARetryingProvision() {
-	s.calls.actorErr = temporal.NewApplicationError("substrate unavailable", activities.ErrTypeSubstrate)
+	s.calls.actorErr = temporal.NewApplicationError("substrate unavailable",
+		activities.ErrTypeSubstrate)
 	start := s.env.Now()
 	s.delete(time.Minute)
 

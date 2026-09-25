@@ -37,7 +37,8 @@ const (
 
 // invalidSpec reports input an activity cannot act on.
 func invalidSpec(format string, args ...any) error {
-	return temporal.NewNonRetryableApplicationError(fmt.Sprintf(format, args...), ErrTypeInvalidSpec, nil)
+	return temporal.NewNonRetryableApplicationError(fmt.Sprintf(format, args...),
+		ErrTypeInvalidSpec, nil)
 }
 
 // classifyTemplateDeletion is classify with one exception. Substrate refuses to

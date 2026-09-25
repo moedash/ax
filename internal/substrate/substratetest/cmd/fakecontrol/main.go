@@ -38,7 +38,8 @@ import (
 func main() {
 	var controlAddr, sandboxAddr string
 	flag.StringVar(&controlAddr, "addr", "127.0.0.1:9001", "Address to serve the fake Control API on")
-	flag.StringVar(&sandboxAddr, "sandbox-addr", "127.0.0.1:9002", "Address to serve the fake sandbox readiness endpoint on")
+	flag.StringVar(&sandboxAddr, "sandbox-addr", "127.0.0.1:9002",
+		"Address to serve the fake sandbox readiness endpoint on")
 	flag.Parse()
 
 	sandbox, err := net.Listen("tcp", sandboxAddr)

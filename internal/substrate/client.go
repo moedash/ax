@@ -279,7 +279,9 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 // EnsureActorTemplateWithImage creates an ActorTemplate using the specified
 // container image and optional environment variables, and reports whether this
 // call is what created it.
-func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, targetAtespace, targetTemplate, image string, extraEnv ...map[string]string) (template *ateapipb.ActorTemplate, created bool, err error) {
+func (c *Client) EnsureActorTemplateWithImage(
+	ctx context.Context, targetAtespace, targetTemplate, image string, extraEnv ...map[string]string,
+) (template *ateapipb.ActorTemplate, created bool, err error) {
 	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
 	if err == nil && existing != nil {
 		return existing, false, nil
@@ -300,7 +302,8 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, targetAtespac
 		return made, true, nil
 	}
 	if status.Code(err) != codes.AlreadyExists {
-		return nil, false, fmt.Errorf("creating actor template %s/%s: %w", targetAtespace, targetTemplate, err)
+		return nil, false, fmt.Errorf("creating actor template %s/%s: %w",
+			targetAtespace, targetTemplate, err)
 	}
 	// Another worker got there first, so the template is not ours to roll back.
 	template, err = c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
@@ -313,7 +316,9 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, targetAtespac
 // Substrate binds an actor to the template it was created from, so a caller
 // that wants a different template has to replace the actor. The created flag
 // is what lets a caller tell "I made this" from "this was already here".
-func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateAtespace, templateName string) (actor *ateapipb.Actor, created bool, err error) {
+func (c *Client) EnsureActor(
+	ctx context.Context, atespace, actorName, templateAtespace, templateName string,
+) (actor *ateapipb.Actor, created bool, err error) {
 	req := &ateapipb.CreateActorRequest{
 		Actor: &ateapipb.Actor{
 			Metadata: &ateapipb.ResourceMetadata{
@@ -386,7 +391,9 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 
 // GetActor fetches an actor. A missing actor is reported as a nil actor rather
 // than an error, so callers can treat absence as one more state.
-func (c *Client) GetActor(ctx context.Context, atespace, actorName string) (*ateapipb.Actor, error) {
+func (c *Client) GetActor(
+	ctx context.Context, atespace, actorName string,
+) (*ateapipb.Actor, error) {
 	actor, err := c.control.GetActor(ctx, &ateapipb.GetActorRequest{
 		Actor: &ateapipb.ObjectRef{
 			Atespace: atespace,

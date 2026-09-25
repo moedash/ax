@@ -38,7 +38,10 @@ const defaultPollInterval = 500 * time.Millisecond
 // Expiry is reported as not-ready rather than as an error: a workspace that is
 // slow to come up leaves the task running with WorkspaceReady False, which is
 // what an operator needs to see.
-func (a *Activities) AwaitWorkspaceReady(ctx context.Context, in WorkspaceReadyInput) (bool, error) {
+func (a *Activities) AwaitWorkspaceReady(
+	ctx context.Context,
+	in WorkspaceReadyInput,
+) (bool, error) {
 	if in.WorkerIP == "" {
 		return false, nil
 	}
@@ -69,7 +72,8 @@ func (a *Activities) AwaitWorkspaceReady(ctx context.Context, in WorkspaceReadyI
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			logger.Info("workspace setup still running", "actor", in.Actor.Name, "waited", in.Timeout.String())
+			logger.Info("workspace setup still running", "actor", in.Actor.Name, "waited",
+				in.Timeout.String())
 			return false, nil
 		}
 		if remaining < interval {

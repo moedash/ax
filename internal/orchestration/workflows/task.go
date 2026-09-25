@@ -111,7 +111,8 @@ func runTask(ctx workflow.Context, cfg Config, in TaskWorkflowInput) error {
 	if r.desired == nil {
 		// Started together with the update that carries the spec. Nothing about
 		// this task is known until it lands.
-		applied, err := workflow.AwaitWithTimeout(ctx, firstApplyTimeout, func() bool { return r.desired != nil })
+		applied, err := workflow.AwaitWithTimeout(ctx, firstApplyTimeout,
+			func() bool { return r.desired != nil })
 		if err != nil {
 			return err
 		}
@@ -450,15 +451,17 @@ func (r *taskRun) provision(ctx workflow.Context) error {
 		return workflow.ExecuteActivity(ctx, acts.DeleteActorTemplateIfExists, template).
 			Get(ctx, nil)
 	})
-	var provisionedTemplate activities.TemplateProvision
-	if err := workflow.ExecuteActivity(provisionCtx, acts.EnsureActorTemplate, activities.TemplateInput{
+	templateIn := activities.TemplateInput{
 		Template:   template,
 		Image:      desired.Task.GetSpec().GetImage(),
 		Task:       desired.Task,
 		Workspaces: desired.Workspaces,
 		WorkflowID: workflow.GetInfo(ctx).WorkflowExecution.ID,
 		Generation: r.generation,
-	}).Get(provisionCtx, &provisionedTemplate); err != nil {
+	}
+	var provisionedTemplate activities.TemplateProvision
+	if err := workflow.ExecuteActivity(provisionCtx, acts.EnsureActorTemplate, templateIn).
+		Get(provisionCtx, &provisionedTemplate); err != nil {
 		saga.run(ctx)
 		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
 			"TemplateCreationFailed", err.Error())
@@ -579,8 +582,10 @@ func (r *taskRun) activate(ctx workflow.Context) error {
 			return nil
 		}
 		suspendCtx := workflow.WithActivityOptions(ctx, activities.ActorOptions())
-		if err := workflow.ExecuteActivity(suspendCtx, acts.SuspendActor, actor).Get(suspendCtx, nil); err != nil {
-			r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "ActorSuspendFailed", err.Error())
+		if err := workflow.ExecuteActivity(suspendCtx, acts.SuspendActor, actor).
+			Get(suspendCtx, nil); err != nil {
+			r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "ActorSuspendFailed",
+				err.Error())
 			return err
 		}
 		r.sandbox = sandboxSuspended
@@ -593,8 +598,10 @@ func (r *taskRun) activate(ctx workflow.Context) error {
 	if r.sandbox != sandboxRunning || r.status.GetWorkerIp() == "" {
 		resumeCtx := workflow.WithActivityOptions(ctx, activities.ResumeOptions())
 		var workerIP string
-		if err := workflow.ExecuteActivity(resumeCtx, acts.ResumeActor, actor).Get(resumeCtx, &workerIP); err != nil {
-			r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "ActorResumeFailed", err.Error())
+		if err := workflow.ExecuteActivity(resumeCtx, acts.ResumeActor, actor).
+			Get(resumeCtx, &workerIP); err != nil {
+			r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "ActorResumeFailed",
+				err.Error())
 			return err
 		}
 		r.sandbox = sandboxRunning
@@ -613,9 +620,11 @@ func (r *taskRun) syncReady(ctx workflow.Context) {
 	case r.teardownFailed:
 		// The sandbox may well be running, but the task was asked to go and is
 		// still here, which is the thing worth reporting.
-		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TeardownFailed", r.teardownMessage)
+		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TeardownFailed",
+			r.teardownMessage)
 	case r.sandbox == sandboxSuspended:
-		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TaskSuspended", "Task is suspended")
+		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TaskSuspended",
+			"Task is suspended")
 	case r.completed:
 		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "CommandExited",
 			fmt.Sprintf("Task command exited with code %d", r.status.GetExitCode()))
@@ -649,7 +658,8 @@ func (r *taskRun) settleWorkspace(ctx workflow.Context) {
 		if generation != r.generation {
 			// The sandbox this probe was talking to is gone. Its answer says
 			// nothing about the one that replaced it.
-			workflow.GetLogger(gctx).Info("dropping a workspace probe for a replaced sandbox", "task", r.key())
+			workflow.GetLogger(gctx).Info("dropping a workspace probe for a replaced sandbox",
+				"task", r.key())
 			return
 		}
 		r.probing = false
@@ -659,7 +669,8 @@ func (r *taskRun) settleWorkspace(ctx workflow.Context) {
 			// resync looks again, so nothing has to be retried here.
 			r.workspaceProbed = true
 			workflow.GetLogger(gctx).Error("workspace probe failed", "task", r.key(), "error", err)
-			r.setCondition(gctx, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionFalse, "ProbeFailed", err.Error())
+			r.setCondition(gctx, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionFalse, "ProbeFailed",
+				err.Error())
 		case ready:
 			r.workspaceProbed = true
 			r.setCondition(gctx, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionTrue, "SetupComplete",
@@ -684,7 +695,8 @@ func (r *taskRun) resync(ctx workflow.Context, cfg Config) {
 	observeCtx := workflow.WithActivityOptions(ctx, activities.ObserveOptions(cfg.ResyncInterval))
 
 	var observed activities.ActorObservation
-	if err := workflow.ExecuteActivity(observeCtx, acts.ObserveActor, r.actorRef()).Get(observeCtx, &observed); err != nil {
+	if err := workflow.ExecuteActivity(observeCtx, acts.ObserveActor, r.actorRef()).
+		Get(observeCtx, &observed); err != nil {
 		logger.Warn("could not observe the task sandbox", "task", r.key(), "error", err)
 		return
 	}
@@ -752,15 +764,19 @@ func (r *taskRun) teardown(ctx workflow.Context) error {
 	actor := r.actorRef()
 
 	logger.Info("tearing down task sandbox", "task", r.key())
-	if err := workflow.ExecuteActivity(teardownCtx, acts.DeleteActorIfExists, actor).Get(teardownCtx, nil); err != nil {
+	if err := workflow.ExecuteActivity(teardownCtx, acts.DeleteActorIfExists, actor).
+		Get(teardownCtx, nil); err != nil {
 		logger.Error("could not delete the task actor", "task", r.key(), "error", err)
-		r.failTeardown(ctx, fmt.Sprintf("Actor %s/%s is still there: %v", actor.Atespace, actor.Name, err))
+		r.failTeardown(ctx,
+			fmt.Sprintf("Actor %s/%s is still there: %v", actor.Atespace, actor.Name, err))
 		return err
 	}
-	if err := workflow.ExecuteActivity(teardownCtx, acts.DeleteActorTemplates,
-		activities.TemplatesInput{Atespace: actor.Atespace, TaskName: actor.Name}).Get(teardownCtx, nil); err != nil {
+	templates := activities.TemplatesInput{Atespace: actor.Atespace, TaskName: actor.Name}
+	if err := workflow.ExecuteActivity(teardownCtx, acts.DeleteActorTemplates, templates).
+		Get(teardownCtx, nil); err != nil {
 		logger.Error("could not delete the task actor templates", "task", r.key(), "error", err)
-		r.failTeardown(ctx, fmt.Sprintf("Actor templates of %s/%s are still there: %v", actor.Atespace, actor.Name, err))
+		r.failTeardown(ctx,
+			fmt.Sprintf("Actor templates of %s/%s are still there: %v", actor.Atespace, actor.Name, err))
 		return err
 	}
 
@@ -838,7 +854,8 @@ func (r *taskRun) key() string {
 	if r.desired == nil {
 		return r.workflowID
 	}
-	return TaskWorkflowID(r.desired.Task.GetMetadata().GetAtespace(), r.desired.Task.GetMetadata().GetName())
+	return TaskWorkflowID(r.desired.Task.GetMetadata().GetAtespace(),
+		r.desired.Task.GetMetadata().GetName())
 }
 
 // syncPhase derives the reported phase from the run's state. Deriving it in one

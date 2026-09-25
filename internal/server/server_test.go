@@ -79,7 +79,8 @@ func TestServerGRPC(t *testing.T) {
 	}()
 	defer httpServer.Close()
 
-	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(ln.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to dial gRPC: %v", err)
 	}
@@ -355,7 +356,8 @@ func TestUpdateTaskResolvesBindings(t *testing.T) {
 		t.Errorf("expected one resolved workspace, got %v", applied.Workspaces)
 	}
 	if applied.Task.GetMetadata().GetAtespace() != "default" {
-		t.Errorf("expected the atespace to be defaulted, got %q", applied.Task.GetMetadata().GetAtespace())
+		t.Errorf("expected the atespace to be defaulted, got %q",
+			applied.Task.GetMetadata().GetAtespace())
 	}
 }
 
@@ -379,7 +381,8 @@ func TestWatchTaskStreamsUntilReady(t *testing.T) {
 	go func() { _ = httpServer.Serve(ln) }()
 	defer httpServer.Close()
 
-	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(ln.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to dial gRPC: %v", err)
 	}
@@ -396,7 +399,8 @@ func TestWatchTaskStreamsUntilReady(t *testing.T) {
 		t.Fatalf("UpdateTask failed: %v", err)
 	}
 
-	stream, err := client.WatchTask(ctx, &v1alpha1.WatchTaskRequest{Atespace: "default", Name: "watched"})
+	stream, err := client.WatchTask(ctx,
+		&v1alpha1.WatchTaskRequest{Atespace: "default", Name: "watched"})
 	if err != nil {
 		t.Fatalf("WatchTask failed: %v", err)
 	}
@@ -438,7 +442,8 @@ func serveGRPC(t *testing.T, srv *server.Server) v1alpha1.AXClient {
 	go func() { _ = httpServer.Serve(ln) }()
 	t.Cleanup(func() { _ = httpServer.Close() })
 
-	conn, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(ln.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("failed to dial gRPC: %v", err)
 	}
@@ -465,7 +470,8 @@ func TestWatchTaskOutlastsAWorkerRestart(t *testing.T) {
 	}
 
 	tasks.workerAway(3)
-	stream, err := client.WatchTask(ctx, &v1alpha1.WatchTaskRequest{Atespace: "default", Name: "watched"})
+	stream, err := client.WatchTask(ctx,
+		&v1alpha1.WatchTaskRequest{Atespace: "default", Name: "watched"})
 	if err != nil {
 		t.Fatalf("WatchTask failed: %v", err)
 	}
@@ -478,7 +484,8 @@ func TestWatchTaskOutlastsAWorkerRestart(t *testing.T) {
 	}
 
 	tasks.workerAway(1000)
-	stream, err = client.WatchTask(ctx, &v1alpha1.WatchTaskRequest{Atespace: "default", Name: "watched"})
+	stream, err = client.WatchTask(ctx,
+		&v1alpha1.WatchTaskRequest{Atespace: "default", Name: "watched"})
 	if err != nil {
 		t.Fatalf("WatchTask failed: %v", err)
 	}
@@ -533,7 +540,8 @@ func TestListTasksCapsTheLimit(t *testing.T) {
 	tasks := newFakeTasks()
 	srv := server.NewServer(memory.NewStore(), tasks, server.Options{})
 
-	if _, err := srv.ListTasks(context.Background(), &v1alpha1.ListTasksRequest{Limit: 1_000_000}); err != nil {
+	req := &v1alpha1.ListTasksRequest{Limit: 1_000_000}
+	if _, err := srv.ListTasks(context.Background(), req); err != nil {
 		t.Fatalf("ListTasks failed: %v", err)
 	}
 	if tasks.lastLimit <= 0 || tasks.lastLimit >= 1_000_000 {
@@ -568,10 +576,13 @@ func TestUpdateRejectsNamesThatAreNotDNSLabels(t *testing.T) {
 	}}); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("expected InvalidArgument for a gateway name with a quote, got %v", err)
 	}
-	if _, err := srv.UpdateWorkspace(ctx, &v1alpha1.UpdateWorkspaceRequest{Workspace: &v1alpha1.Workspace{
+	badWorkspace := &v1alpha1.Workspace{
 		Metadata: &v1alpha1.ObjectMeta{Name: bad},
 		Spec:     &v1alpha1.WorkspaceSpec{},
-	}}); status.Code(err) != codes.InvalidArgument {
+	}
+	if _, err := srv.UpdateWorkspace(ctx, &v1alpha1.UpdateWorkspaceRequest{
+		Workspace: badWorkspace,
+	}); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("expected InvalidArgument for a workspace name with a quote, got %v", err)
 	}
 	if _, err := srv.UpdateModel(ctx, &v1alpha1.UpdateModelRequest{Model: &v1alpha1.Model{

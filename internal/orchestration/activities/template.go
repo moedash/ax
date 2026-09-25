@@ -68,8 +68,10 @@ func TaskTemplateName(
 		d.field("env", env.GetName(), env.GetValue())
 	}
 	d.field("debug", strconv.FormatBool(spec.GetDebug()))
-	d.field("cpu", spec.GetResources().GetRequests().GetCpu(), spec.GetResources().GetLimits().GetCpu())
-	d.field("memory", spec.GetResources().GetRequests().GetMemory(), spec.GetResources().GetLimits().GetMemory())
+	d.field("cpu", spec.GetResources().GetRequests().GetCpu(),
+		spec.GetResources().GetLimits().GetCpu())
+	d.field("memory", spec.GetResources().GetRequests().GetMemory(),
+		spec.GetResources().GetLimits().GetMemory())
 	for _, ref := range spec.WorkspaceRefs() {
 		d.field("workspace", ref.GetName(), ref.GetPath(), ref.GetGoal())
 	}
@@ -87,7 +89,8 @@ func digestWorkspace(d *digest, ws *v1alpha1.Workspace) {
 	spec := ws.GetSpec()
 	d.field("workspace-spec", ws.GetMetadata().GetName())
 	for _, repo := range spec.GetGit() {
-		d.field("git", repo.GetName(), repo.GetRepo(), repo.GetBranch(), repo.GetDir(), strconv.Itoa(int(repo.GetDepth())))
+		d.field("git", repo.GetName(), repo.GetRepo(), repo.GetBranch(), repo.GetDir(),
+			strconv.Itoa(int(repo.GetDepth())))
 	}
 	for _, registry := range spec.GetMcp().GetRegistries() {
 		d.field("mcp-registry", registry.GetProvider(), registry.GetProject(), registry.GetQuery())
@@ -132,7 +135,8 @@ func (d *digest) sum() []byte {
 // TaskTemplatePattern matches every ActorTemplate name TaskTemplateName can
 // produce for the given task, across all spec revisions.
 func TaskTemplatePattern(taskName string) *regexp.Regexp {
-	return regexp.MustCompile(fmt.Sprintf("^%s-tmpl-[0-9a-f]{%d}$", regexp.QuoteMeta(taskName), 2*templateDigestBytes))
+	return regexp.MustCompile(
+		fmt.Sprintf("^%s-tmpl-[0-9a-f]{%d}$", regexp.QuoteMeta(taskName), 2*templateDigestBytes))
 }
 
 // SandboxSpec returns the part of a task that decides what its sandbox is made
@@ -158,7 +162,10 @@ func SandboxSpec(task *v1alpha1.Task) *v1alpha1.Task {
 // containerEnv builds the environment of a task's container: the task's own
 // env, the model credentials, the specs the runner needs, and the coordinates
 // of the workflow that owns the task.
-func (a *Activities) containerEnv(ctx context.Context, in TemplateInput) (map[string]string, error) {
+func (a *Activities) containerEnv(
+	ctx context.Context,
+	in TemplateInput,
+) (map[string]string, error) {
 	env := make(map[string]string)
 	for _, e := range in.Task.GetSpec().GetEnv() {
 		if e.GetName() != "" {
@@ -208,7 +215,8 @@ func (a *Activities) lookupGeminiKey(ctx context.Context, atespace string) strin
 	if a.SecretResolver != nil {
 		lookupCtx, cancel := context.WithTimeout(ctx, secretLookupTimeout)
 		defer cancel()
-		if key, err := a.SecretResolver(lookupCtx, atespace, geminiSecretName, geminiSecretKey); err == nil && key != "" {
+		key, err := a.SecretResolver(lookupCtx, atespace, geminiSecretName, geminiSecretKey)
+		if err == nil && key != "" {
 			return key
 		}
 	}
