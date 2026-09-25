@@ -113,10 +113,12 @@ as search attributes, updated whenever its phase or its bindings change. That
 is what makes a listing one call, and what makes "which tasks bind this
 gateway" a question with an answer.
 
-A workflow answers queries after it has closed, so a task that has been deleted
-would still describe itself. `GetTask` therefore treats a task that reports
-`Terminating` as gone once its execution is no longer running, and `ListTasks`
-only asks about running ones.
+A workflow answers queries after it has closed, so a task that has been deleted,
+cancelled, terminated, or failed would still describe itself for as long as its
+history is retained. `GetTask` therefore sends the `task` query with
+`QueryRejectCondition: NOT_OPEN`: a closed run rejects the query, and the
+rejection is answered as `NotFound` whatever the run closed as. `ListTasks`
+only asks visibility about running ones.
 
 Every update has a validator, and every validator only reads state: it rejects a
 change to a task that is being deleted, and a spec that cannot be applied, before

@@ -129,12 +129,24 @@ func (c *Client) Apply(ctx context.Context, desired *workflows.TaskDesiredState)
 // the wait. The start and the update travel in one request, so an expired wait
 // says nothing about whether the task was created: the execution is asked for
 // directly, and the task is reported Pending only if it is really there.
-func (c *Client) acceptedTask(ctx context.Context, workflowID string, task *v1alpha1.Task) (*v1alpha1.Task, error) {
+//
+// The latest run has to be open. A closed run under the same ID is the task
+// that was deleted before, and says nothing about whether this start landed.
+func (c *Client) acceptedTask(
+	ctx context.Context, workflowID string, task *v1alpha1.Task,
+) (*v1alpha1.Task, error) {
 	describeCtx, cancel := context.WithTimeout(ctx, c.queryWait)
 	defer cancel()
 
-	if _, err := c.client.DescribeWorkflowExecution(describeCtx, workflowID, ""); err != nil {
-		return nil, fmt.Errorf("%w: task %s was not accepted: %s", orchestration.ErrTaskUnavailable, workflowID, err)
+	described, err := c.client.DescribeWorkflowExecution(describeCtx, workflowID, "")
+	if err != nil {
+		return nil, fmt.Errorf("%w: task %s was not accepted: %s",
+			orchestration.ErrTaskUnavailable, workflowID, err)
+	}
+	if described.GetWorkflowExecutionInfo().GetStatus() !=
+		enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING {
+		return nil, fmt.Errorf("%w: task %s was not accepted: its workflow is not running",
+			orchestration.ErrTaskUnavailable, workflowID)
 	}
 	out, ok := proto.Clone(task).(*v1alpha1.Task)
 	if !ok {
@@ -160,45 +172,36 @@ func timedOut(ctx, waitCtx context.Context) bool {
 // Get returns one task as its workflow sees it. Only a worker can answer for a
 // task, so the wait is bounded and a task nothing answers for is reported
 // unavailable rather than left hanging.
+//
+// A workflow answers queries after it has closed, for as long as its history
+// is retained. A task exists only while its workflow runs, whatever the run
+// closed as, so the query is sent with a reject condition and a rejection is
+// the task being gone.
 func (c *Client) Get(ctx context.Context, atespace, name string) (*v1alpha1.Task, error) {
 	workflowID := workflows.TaskWorkflowID(atespaceOf(atespace), name)
 	queryCtx, cancel := context.WithTimeout(ctx, c.queryWait)
 	defer cancel()
 
-	value, err := c.client.QueryWorkflow(queryCtx, workflowID, "", workflows.QueryTask)
+	resp, err := c.client.QueryWorkflowWithOptions(queryCtx, &sdkclient.QueryWorkflowWithOptionsRequest{
+		WorkflowID:           workflowID,
+		QueryType:            workflows.QueryTask,
+		QueryRejectCondition: enumspb.QUERY_REJECT_CONDITION_NOT_OPEN,
+	})
 	if err != nil {
 		if timedOut(ctx, queryCtx) {
-			return nil, fmt.Errorf("%w: no worker answered for task %s", orchestration.ErrTaskUnavailable, workflowID)
+			return nil, fmt.Errorf("%w: no worker answered for task %s",
+				orchestration.ErrTaskUnavailable, workflowID)
 		}
 		return nil, mapError(err)
 	}
-	var task v1alpha1.Task
-	if err := value.Get(&task); err != nil {
-		return nil, fmt.Errorf("decoding task %s/%s: %w", atespace, name, err)
-	}
-	if gone, err := c.isGone(ctx, workflowID, &task); err != nil {
-		return nil, err
-	} else if gone {
+	if resp.QueryRejected != nil {
 		return nil, fmt.Errorf("%w: %s", orchestration.ErrTaskNotFound, workflowID)
 	}
+	var task v1alpha1.Task
+	if err := resp.QueryResult.Get(&task); err != nil {
+		return nil, fmt.Errorf("decoding task %s/%s: %w", atespace, name, err)
+	}
 	return &task, nil
-}
-
-// isGone reports whether a task that says it is terminating has actually
-// finished going. A workflow answers queries after it has closed, so the
-// execution itself is what says the sandbox is gone for good.
-func (c *Client) isGone(ctx context.Context, workflowID string, task *v1alpha1.Task) (bool, error) {
-	if task.GetStatus().GetPhase() != v1alpha1.PhaseTerminating {
-		return false, nil
-	}
-	describeCtx, cancel := context.WithTimeout(ctx, c.queryWait)
-	defer cancel()
-
-	described, err := c.client.DescribeWorkflowExecution(describeCtx, workflowID, "")
-	if err != nil {
-		return false, mapError(err)
-	}
-	return described.GetWorkflowExecutionInfo().GetStatus() != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, nil
 }
 
 // List returns the tasks of an atespace from visibility alone. A listing must

@@ -70,9 +70,10 @@ func (r *taskRun) registerHandlers(ctx workflow.Context) error {
 	return nil
 }
 
-// queryTask returns the whole task. A task that has been torn down answers with
-// the Terminating phase it ended on; its execution has closed by then, which is
-// how the API server knows the task is gone.
+// queryTask returns the whole task. A task that has been torn down still
+// answers with the Terminating phase it ended on; the API server asks for the
+// query to be rejected once the execution has closed, so nothing here has to
+// say the task is gone.
 func (r *taskRun) queryTask() (*v1alpha1.Task, error) {
 	return r.taskSnapshot(), nil
 }

@@ -23,6 +23,7 @@ import (
 
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	querypb "go.temporal.io/api/query/v1"
 	"go.temporal.io/api/serviceerror"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
@@ -52,10 +53,14 @@ type fakeTemporal struct {
 	// blockUpdate holds the update open until the caller's context expires.
 	blockUpdate bool
 
-	// queryResult and queryErr answer QueryWorkflow.
-	queryResult *v1alpha1.Task
-	queryErr    error
-	queries     int
+	// queryResult and queryErr answer QueryWorkflowWithOptions. queryRejected
+	// stands in for the service rejecting the query because the run is closed,
+	// and rejectCondition records what the client asked for.
+	queryResult     *v1alpha1.Task
+	queryErr        error
+	queryRejected   bool
+	rejectCondition enumspb.QueryRejectCondition
+	queries         int
 
 	// describeStatus and describeErr answer DescribeWorkflowExecution.
 	describeStatus enumspb.WorkflowExecutionStatus
@@ -92,12 +97,24 @@ func (f *fakeTemporal) answerUpdate(ctx context.Context) (sdkclient.WorkflowUpda
 	return &fakeUpdateHandle{result: f.updateResult}, nil
 }
 
-func (f *fakeTemporal) QueryWorkflow(ctx context.Context, workflowID, runID, queryType string, args ...any) (converter.EncodedValue, error) {
+func (f *fakeTemporal) QueryWorkflowWithOptions(
+	ctx context.Context, request *sdkclient.QueryWorkflowWithOptionsRequest,
+) (*sdkclient.QueryWorkflowWithOptionsResponse, error) {
 	f.queries++
+	f.rejectCondition = request.QueryRejectCondition
 	if f.queryErr != nil {
 		return nil, f.queryErr
 	}
-	return encodedTask{task: f.queryResult}, nil
+	if f.queryRejected {
+		return &sdkclient.QueryWorkflowWithOptionsResponse{
+			QueryRejected: &querypb.QueryRejected{
+				Status: enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+			},
+		}, nil
+	}
+	return &sdkclient.QueryWorkflowWithOptionsResponse{
+		QueryResult: encodedTask{task: f.queryResult},
+	}, nil
 }
 
 func (f *fakeTemporal) DescribeWorkflowExecution(ctx context.Context, workflowID, runID string) (*workflowservice.DescribeWorkflowExecutionResponse, error) {
@@ -301,6 +318,21 @@ func TestApplyReportsUnavailableWhenNothingWasStarted(t *testing.T) {
 	}
 }
 
+// A task that was deleted leaves a closed run under the same ID. Finding it
+// says nothing about whether a new start landed, so it is not accepted either.
+func TestApplyDoesNotTakeAClosedRunAsAccepted(t *testing.T) {
+	fake := &fakeTemporal{
+		blockUpdate:    true,
+		describeStatus: enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
+	}
+	client := newTestClient(fake)
+
+	_, err := client.Apply(context.Background(), testDesired())
+	if !errors.Is(err, orchestration.ErrTaskUnavailable) {
+		t.Fatalf("expected %v, got %v", orchestration.ErrTaskUnavailable, err)
+	}
+}
+
 func TestApplyRejectsATaskWithNoName(t *testing.T) {
 	client := newTestClient(&fakeTemporal{})
 	desired := testDesired()
@@ -323,30 +355,36 @@ func TestGetReturnsARunningTask(t *testing.T) {
 	if task.GetStatus().GetPhase() != v1alpha1.PhaseRunning {
 		t.Errorf("expected a running task, got %v", task.GetStatus())
 	}
+	if fake.rejectCondition != enumspb.QUERY_REJECT_CONDITION_NOT_OPEN {
+		t.Errorf("expected the query to be rejected for a closed run, got %v", fake.rejectCondition)
+	}
 	if fake.describes != 0 {
-		t.Error("a task that is not terminating needs no second call")
+		t.Error("one query answers for a task; no second call is needed")
 	}
 }
 
-// A workflow answers queries after it has closed, so a task that reports
-// terminating is only gone once its execution has ended.
-func TestGetMapsAFinishedTaskToNotFound(t *testing.T) {
-	terminating := runningTask()
-	terminating.Status.Phase = v1alpha1.PhaseTerminating
-
-	fake := &fakeTemporal{
-		queryResult:    terminating,
-		describeStatus: enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED,
-	}
+// A workflow answers queries after it has closed, so the client asks for the
+// query to be rejected on a closed run. A task whose run closed is gone,
+// whatever phase it reported last and whatever closed it.
+func TestGetMapsAClosedRunToNotFound(t *testing.T) {
+	fake := &fakeTemporal{queryResult: runningTask(), queryRejected: true}
 	client := newTestClient(fake)
 
 	_, err := client.Get(context.Background(), "team-a", "job")
 	if !errors.Is(err, orchestration.ErrTaskNotFound) {
 		t.Fatalf("expected %v, got %v", orchestration.ErrTaskNotFound, err)
 	}
+	if fake.describes != 0 {
+		t.Error("the rejection says the run is closed; nothing else has to be asked")
+	}
+}
 
-	// The same task while its sandbox is still being torn down is still there.
-	fake.describeStatus = enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING
+// A task whose sandbox is still being torn down is still there.
+func TestGetReturnsATerminatingTask(t *testing.T) {
+	terminating := runningTask()
+	terminating.Status.Phase = v1alpha1.PhaseTerminating
+	client := newTestClient(&fakeTemporal{queryResult: terminating})
+
 	task, err := client.Get(context.Background(), "team-a", "job")
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
