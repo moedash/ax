@@ -101,6 +101,10 @@ type CommandExit struct {
 	ExitCode int
 	// Err is nil when the command exited with status zero.
 	Err error
+	// Stopped is true when the runner itself ended the command because it was
+	// told to shut down, as on a suspend or a stop of the sandbox. The exit then
+	// says nothing about the command's own work.
+	Stopped bool
 }
 
 // Run executes the task-runner lifecycle and blocks until ctx is cancelled.
@@ -191,11 +195,11 @@ func Run(ctx context.Context, cfg Config) error {
 
 	select {
 	case err := <-exited:
-		reportExit(cfg, cmd, err)
+		reportExit(cfg, cmd, err, false)
 		// Keep the sandbox up and inspectable until told to stop.
 		<-ctx.Done()
 	case <-ctx.Done():
-		reportExit(cfg, cmd, stopCommand(cmd, exited))
+		reportExit(cfg, cmd, stopCommand(cmd, exited), true)
 	}
 	return nil
 }
@@ -220,8 +224,8 @@ func stopCommand(cmd *exec.Cmd, exited <-chan error) error {
 }
 
 // reportExit logs how the command finished and notifies the OnCommandExit hook.
-func reportExit(cfg Config, cmd *exec.Cmd, err error) {
-	exit := CommandExit{Pid: cmd.Process.Pid, ExitCode: -1, Err: err}
+func reportExit(cfg Config, cmd *exec.Cmd, err error, stopped bool) {
+	exit := CommandExit{Pid: cmd.Process.Pid, ExitCode: -1, Err: err, Stopped: stopped}
 	if cmd.ProcessState != nil {
 		exit.ExitCode = cmd.ProcessState.ExitCode()
 	}

@@ -31,11 +31,13 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"gopkg.in/yaml.v3"
 
 	"github.com/google/ax/internal/orchestration/workflows"
@@ -43,10 +45,17 @@ import (
 	"github.com/google/ax/runner"
 )
 
-// reportTimeout bounds reporting the command's exit. The sandbox stays up after
-// the command finishes, so a report that cannot be delivered quickly is dropped
-// rather than held on to.
-const reportTimeout = 10 * time.Second
+// The two waits that bound reporting the command's exit. The sandbox stays up
+// after the command finishes, so a report that cannot be delivered quickly is
+// dropped rather than held on to.
+const (
+	// updateWait is how long the update may wait for a worker to accept it and
+	// answer. With no worker polling, the update sits until this expires.
+	updateWait = 5 * time.Second
+	// signalWait is the signal's own budget. A signal needs only the service,
+	// so it must not inherit a deadline the update has already used up.
+	signalWait = 5 * time.Second
+)
 
 // stringList collects a repeatable flag.
 type stringList []string
@@ -155,6 +164,12 @@ func loadWorkspaces(files []string) ([]*v1alpha1.Workspace, error) {
 // best effort: this process is PID 1 of the sandbox, and the sandbox has to stay
 // up and inspectable whether or not the control plane can be reached.
 func reportCommandExit(exit runner.CommandExit) {
+	if exit.Stopped {
+		// The sandbox is being stopped or suspended. How the command died says
+		// nothing about the task's work, so it is not reported as a completion.
+		slog.Info("not reporting an exit caused by the sandbox stopping", "exitCode", exit.ExitCode)
+		return
+	}
 	address := os.Getenv(v1alpha1.EnvTemporalAddress)
 	workflowID := os.Getenv(v1alpha1.EnvWorkflowID)
 	if address == "" || workflowID == "" {
@@ -162,11 +177,8 @@ func reportCommandExit(exit runner.CommandExit) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), reportTimeout)
-	defer cancel()
-
 	// A lazy client connects on first use, so the whole report stays inside the
-	// deadline above instead of blocking PID 1 on a dial.
+	// waits below instead of blocking PID 1 on a dial.
 	c, err := client.NewLazyClient(client.Options{
 		HostPort:  address,
 		Namespace: os.Getenv(v1alpha1.EnvTemporalNamespace),
@@ -181,26 +193,60 @@ func reportCommandExit(exit runner.CommandExit) {
 	if exit.Err != nil {
 		in.Message = exit.Err.Error()
 	}
+	// The generation is what lets the workflow tell this sandbox's report from
+	// one sent by a sandbox it has since replaced.
+	if generation, err := strconv.Atoi(os.Getenv(v1alpha1.EnvSandboxGeneration)); err == nil {
+		in.Generation = generation
+	}
 
-	handle, err := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
-		WorkflowID:   workflowID,
+	r := exitReporter{client: c, workflowID: workflowID, updateWait: updateWait, signalWait: signalWait}
+	if err := r.report(in); err != nil {
+		slog.Error("could not report the task command exit", "workflow", workflowID, "error", err)
+		return
+	}
+	slog.Info("reported the task command exit", "workflow", workflowID, "exitCode", exit.ExitCode)
+}
+
+// exitReporter delivers one completion report to the task's workflow.
+type exitReporter struct {
+	client     client.Client
+	workflowID string
+	updateWait time.Duration
+	signalWait time.Duration
+}
+
+// report tries the update first, because an accepted update says the report
+// landed, and falls back to the signal, which needs no worker. The two get
+// separate deadlines: an update that waited for a worker until its deadline
+// would otherwise leave the signal none.
+func (r exitReporter) report(in workflows.CompleteInput) error {
+	updateCtx, cancelUpdate := context.WithTimeout(context.Background(), r.updateWait)
+	defer cancelUpdate()
+
+	handle, err := r.client.UpdateWorkflow(updateCtx, client.UpdateWorkflowOptions{
+		WorkflowID:   r.workflowID,
 		UpdateName:   workflows.UpdateComplete,
 		Args:         []any{in},
 		WaitForStage: client.WorkflowUpdateStageCompleted,
 	})
 	if err == nil {
-		if err = handle.Get(ctx, nil); err == nil {
-			slog.Info("reported the task command exit", "workflow", workflowID, "exitCode", exit.ExitCode)
-			return
-		}
+		err = handle.Get(updateCtx, nil)
 	}
-
-	// An update needs a worker to accept it. A signal only needs the service, so
-	// it still records the exit when no worker is available right now.
+	if err == nil {
+		return nil
+	}
+	// A refusal is the workflow's answer, not a delivery problem: the task is
+	// going away, or this sandbox has been replaced. A signal would say nothing
+	// the update did not.
+	var refused *temporal.ApplicationError
+	if errors.As(err, &refused) {
+		return err
+	}
 	slog.Warn("could not report the task command exit as an update", "error", err)
-	if err := c.SignalWorkflow(ctx, workflowID, "", workflows.SignalComplete, in); err != nil {
-		slog.Error("could not report the task command exit", "workflow", workflowID, "error", err)
-	}
+
+	signalCtx, cancelSignal := context.WithTimeout(context.Background(), r.signalWait)
+	defer cancelSignal()
+	return r.client.SignalWorkflow(signalCtx, r.workflowID, "", workflows.SignalComplete, in)
 }
 
 func fatal(err error) {
