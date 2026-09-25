@@ -19,6 +19,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"os"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/google/ax/internal/model"
 	"github.com/google/ax/internal/orchestration/activities"
+	"github.com/google/ax/internal/orchestration/taskclient"
 	"github.com/google/ax/internal/orchestration/workflows"
 	"github.com/google/ax/internal/substrate"
 )
@@ -50,6 +52,10 @@ const (
 	// readiness poll can run longer than this and is cut short on purpose: it
 	// is idempotent and another worker picks it up.
 	workerStopTimeout = 6 * time.Minute
+
+	// startupCheckTimeout bounds the one read of the namespace made before the
+	// worker starts polling.
+	startupCheckTimeout = 30 * time.Second
 )
 
 func main() {
@@ -138,6 +144,17 @@ func main() {
 		os.Exit(1)
 	}
 	defer temporalClient.Close()
+
+	// A task publishes search attributes on every phase change. One the
+	// namespace does not have fails the workflow task, so every task would loop
+	// without ever saying why; better to refuse to start and say it here.
+	verifyCtx, cancelVerify := context.WithTimeout(context.Background(), startupCheckTimeout)
+	err = taskclient.VerifySearchAttributes(verifyCtx, temporalClient.OperatorService(), temporalNamespace)
+	cancelVerify()
+	if err != nil {
+		slog.Error("the namespace is not ready for tasks", "error", err)
+		os.Exit(1)
+	}
 
 	w := worker.New(temporalClient, taskQueue, worker.Options{
 		MaxConcurrentActivityExecutionSize: maxConcurrentActivities,

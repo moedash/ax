@@ -40,6 +40,10 @@ const (
 	defaultTemporalAddress   = "localhost:7233"
 	defaultTemporalNamespace = "default"
 	defaultTaskQueue         = "ax-tasks"
+
+	// startupCheckTimeout bounds the one read of the namespace made before the
+	// server starts listening.
+	startupCheckTimeout = 30 * time.Second
 )
 
 func main() {
@@ -108,6 +112,16 @@ func main() {
 		os.Exit(1)
 	}
 	defer temporalClient.Close()
+
+	// Listing tasks reads the search attributes a task publishes. Without them
+	// every listing fails, so the server refuses to start and says what to run.
+	verifyCtx, cancelVerify := context.WithTimeout(context.Background(), startupCheckTimeout)
+	err = taskclient.VerifySearchAttributes(verifyCtx, temporalClient.OperatorService(), temporalNamespace)
+	cancelVerify()
+	if err != nil {
+		slog.Error("the namespace is not ready for tasks", "error", err)
+		os.Exit(1)
+	}
 
 	srv := server.NewServer(
 		redis.NewStore(rClient, redis.Options{}),

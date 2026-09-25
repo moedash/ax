@@ -886,15 +886,16 @@ func (r *taskRun) upsertSearchAttributes(ctx workflow.Context) {
 			workspaces = append(workspaces, ref.GetName())
 		}
 	}
-	err := workflow.UpsertTypedSearchAttributes(ctx,
+	// An attribute the namespace does not have fails the workflow task, not this
+	// call, so there is nothing useful to do with the error here. The worker
+	// checks the attributes exist before it starts, which is where a missing one
+	// is reported.
+	_ = workflow.UpsertTypedSearchAttributes(ctx,
 		AtespaceKey.ValueSet(r.desired.Task.GetMetadata().GetAtespace()),
 		PhaseKey.ValueSet(r.status.GetPhase()),
 		GatewayKey.ValueSet(r.desired.Task.GetSpec().GetGateway().GetName()),
 		WorkspacesKey.ValueSet(workspaces),
 	)
-	if err != nil {
-		workflow.GetLogger(ctx).Warn("could not publish the task to visibility", "task", r.key(), "error", err)
-	}
 }
 
 // recordCompletion stores how the task command finished. The sandbox stays up
