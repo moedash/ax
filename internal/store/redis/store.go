@@ -60,7 +60,6 @@ func (s *Store) taskKey(atespace, name string) string {
 	return fmt.Sprintf("%s:task:%s:%s", s.opts.KeyPrefix, atespace, name)
 }
 
-
 func (s *Store) modelKey(atespace, name string) string {
 	return fmt.Sprintf("%s:model:%s:%s", s.opts.KeyPrefix, atespace, name)
 }
@@ -265,7 +264,6 @@ func (s *Store) DeleteTask(ctx context.Context, atespace, name string) error {
 	}
 	return nil
 }
-
 
 // SaveModel stores a model.
 func (s *Store) SaveModel(ctx context.Context, model *v1alpha1.Model) error {

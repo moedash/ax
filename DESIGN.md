@@ -4,6 +4,8 @@
 
 Storing millions of short-lived tasks as Kubernetes CRDs pushes etcd past its comfort zone (single-digit GB storage limits, write-rate bottlenecks, control plane degradation). AX stores its state in Redis and reconciles directly with Agent Substrate under fine-grained distributed locks.
 
+That synchronous reconciliation is the default. `ax-server --orchestrator=temporal` adds an alternative for the task kinds: each task runs as a Temporal workflow, with the worker hosted in `ax-server`, so provisioning survives a server that dies mid-sequence, failed Substrate calls are retried with a budget, and every sandbox is checked on an interval. Workspaces and models stay in Redis either way. See [Temporal orchestration](docs/temporal.md).
+
 ```
                       ax apply -f task.yaml
                                 │
@@ -26,7 +28,7 @@ Storing millions of short-lived tasks as Kubernetes CRDs pushes etcd past its co
 | Binary | Role |
 |---|---|
 | `ax` | Developer CLI. Applies manifests, inspects and watches resources, tunnels to the cluster. |
-| `ax-server` | Direct-execution gRPC API on port 8080. Validates manifests, manages distributed locks, reconciles directly with Agent Substrate, and persists state to Redis. |
+| `ax-server` | Direct-execution gRPC API on port 8080. Validates manifests, manages distributed locks, reconciles directly with Agent Substrate, and persists state to Redis. With `--orchestrator=temporal` it routes task calls to Temporal workflows and hosts their worker. |
 | `ax-task-runner` | Entrypoint inside every task container. Bootstraps the workspace, serves metadata, and runs the agent command. A thin wrapper over the `runner` package, which custom images can embed directly. |
 
 ## API reference
