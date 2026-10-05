@@ -56,6 +56,10 @@ const (
 	// termination grace period has to allow for it; a call cut short is retried
 	// by another worker either way.
 	workerStopTimeout = 6 * time.Minute
+
+	// startupCheckTimeout bounds the one read of the namespace made before the
+	// server starts listening.
+	startupCheckTimeout = 30 * time.Second
 )
 
 // temporalOptions is everything the Temporal orchestrator needs. The flags are
@@ -67,6 +71,11 @@ type temporalOptions struct {
 	taskQueue      string
 	resyncInterval time.Duration
 	watchInterval  time.Duration
+	// reportCompletion and sandboxAddress hand task containers the coordinates
+	// of their own workflow. See the trust boundary section of docs/temporal.md
+	// before turning it on.
+	reportCompletion bool
+	sandboxAddress   string
 }
 
 func (o *temporalOptions) bindFlags(fs *flag.FlagSet) {
@@ -81,6 +90,13 @@ func (o *temporalOptions) bindFlags(fs *flag.FlagSet) {
 			"Each interval costs one read per task (with --orchestrator=temporal)")
 	fs.DurationVar(&o.watchInterval, "watch-interval", 2*time.Second,
 		"How often WatchTask asks a task workflow for its state (with --orchestrator=temporal)")
+	fs.BoolVar(&o.reportCompletion, "sandbox-report-completion", false,
+		"Let task containers report their command's exit to their own workflow. "+
+			"This gives anything in a sandbox a route to the Temporal frontend, "+
+			"so it is only as safe as the frontend's authentication (with --orchestrator=temporal)")
+	fs.StringVar(&o.sandboxAddress, "sandbox-temporal-address", "",
+		"Temporal address task containers dial to report their command's exit "+
+			"(defaults to --temporal-address)")
 }
 
 // applyEnv lets the deployment override the flags the way the Redis ones are.
@@ -94,11 +110,14 @@ func (o *temporalOptions) applyEnv() {
 	if env := os.Getenv("AX_TASK_QUEUE"); env != "" {
 		o.taskQueue = env
 	}
+	if o.sandboxAddress == "" {
+		o.sandboxAddress = o.address
+	}
 }
 
-// startTemporal connects to Temporal and starts the worker that drives tasks.
-// It returns the client the API server reaches tasks through and a function
-// that stops both.
+// startTemporal connects to Temporal, checks the namespace can list tasks, and
+// starts the worker that drives them. It returns the client the API server
+// reaches tasks through and a function that stops both.
 func startTemporal(
 	ctx context.Context, o temporalOptions, sub *substrate.Client, logger *slog.Logger,
 ) (orchestration.Tasks, func(), error) {
@@ -109,6 +128,17 @@ func startTemporal(
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to temporal at %s: %w", o.address, err)
+	}
+
+	// A task publishes search attributes on every phase change. One the
+	// namespace does not have fails the workflow task, so every task would loop
+	// without ever saying why; better to refuse to start and say it here.
+	verifyCtx, cancel := context.WithTimeout(ctx, startupCheckTimeout)
+	defer cancel()
+	if err := taskclient.VerifySearchAttributes(
+		verifyCtx, temporalClient.OperatorService(), o.namespace); err != nil {
+		temporalClient.Close()
+		return nil, nil, fmt.Errorf("the namespace is not ready for tasks: %w", err)
 	}
 
 	w := worker.New(temporalClient, o.taskQueue, worker.Options{
@@ -122,9 +152,12 @@ func startTemporal(
 		workflow.RegisterOptions{Name: workflows.TaskWorkflowType},
 	)
 	w.RegisterActivity(&activities.Activities{
-		Substrate:      sub,
-		SecretResolver: model.GetKubernetesSecret,
-		RouterAddr:     os.Getenv("ATENET_ROUTER_ADDR"),
+		Substrate:         sub,
+		SecretResolver:    model.GetKubernetesSecret,
+		RouterAddr:        os.Getenv("ATENET_ROUTER_ADDR"),
+		ReportCompletion:  o.reportCompletion,
+		TemporalAddress:   o.sandboxAddress,
+		TemporalNamespace: o.namespace,
 	})
 	if err := w.Start(); err != nil {
 		temporalClient.Close()

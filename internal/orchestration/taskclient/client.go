@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package taskclient reaches AX tasks through Temporal. Reads are queries,
-// changes are updates, and listing walks the running task workflows.
+// changes are updates, and listing goes through visibility.
 package taskclient
 
 import (
@@ -28,6 +28,7 @@ import (
 	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
 	"google.golang.org/protobuf/proto"
 
@@ -91,6 +92,7 @@ func (c *Client) Create(
 		// under the same name.
 		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_FAIL,
 		WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+		TypedSearchAttributes:    temporal.NewSearchAttributes(workflows.AtespaceKey.ValueSet(atespace)),
 		// The update carries the spec, so the start does not repeat it.
 	}, workflows.TaskWorkflowType, workflows.TaskWorkflowInput{})
 
@@ -207,9 +209,10 @@ func (c *Client) Get(ctx context.Context, atespace, name string) (*v1alpha1.Task
 	return &task, nil
 }
 
-// List returns the running task workflows of an atespace. A listing must not
-// cost a round trip to every task, so it reads the identities from visibility
-// and leaves the per-task status to GetTask.
+// List returns the tasks of an atespace from visibility alone. A listing must
+// not cost a round trip to every task it lists, so the workflow publishes what
+// a listing shows and this reads it back. The worker address is the one thing
+// not carried there; GetTask has it.
 func (c *Client) List(
 	ctx context.Context,
 	atespace string,
@@ -241,10 +244,12 @@ func (c *Client) List(
 	return tasks, nil
 }
 
-// listedTask rebuilds a task's identity from its workflow ID. A listing does
-// not carry the task's phase; GetTask has it.
+// listedTask rebuilds a task from the fields visibility carries about it.
 func listedTask(execution *workflowpb.WorkflowExecutionInfo) *v1alpha1.Task {
 	atespace, name := splitWorkflowID(execution.GetExecution().GetWorkflowId())
+	if published := keyword(execution, workflows.AtespaceSearchAttribute); published != "" {
+		atespace = published
+	}
 	return &v1alpha1.Task{
 		ApiVersion: v1alpha1.APIVersion,
 		Kind:       v1alpha1.KindTask,
@@ -253,8 +258,11 @@ func listedTask(execution *workflowpb.WorkflowExecutionInfo) *v1alpha1.Task {
 			Atespace:          atespace,
 			CreationTimestamp: execution.GetStartTime(),
 		},
-		// An actor carries the name of the task that owns it.
-		Status: &v1alpha1.TaskStatus{Actor: name},
+		Status: &v1alpha1.TaskStatus{
+			Phase: keyword(execution, workflows.PhaseSearchAttribute),
+			// An actor carries the name of the task that owns it.
+			Actor: name,
+		},
 	}
 }
 
@@ -269,30 +277,45 @@ func splitWorkflowID(workflowID string) (atespace, name string) {
 	return workflowID[:slash], workflowID[slash+1:]
 }
 
-// listQuery selects the running task workflows. The atespace is matched from
-// the workflow ID after listing, so the query uses only the standard attributes
-// every namespace has.
-func listQuery() string {
-	return fmt.Sprintf("WorkflowType = '%s' AND ExecutionStatus = 'Running'",
-		workflows.TaskWorkflowType)
+// keyword reads one keyword search attribute off a listed execution.
+func keyword(execution *workflowpb.WorkflowExecutionInfo, name string) string {
+	payload, ok := execution.GetSearchAttributes().GetIndexedFields()[name]
+	if !ok {
+		return ""
+	}
+	var value string
+	if err := converter.GetDefaultDataConverter().FromPayload(payload, &value); err != nil {
+		return ""
+	}
+	return value
 }
 
-// listExecutions walks visibility until it has at least want running task
-// workflows, keeping only the ones in the atespace when one is named.
+// listQuery builds the visibility query for an atespace, or for every atespace
+// when it is empty. The value is quoted even though the API server only accepts
+// atespaces that are DNS labels, so the query cannot be steered by its input
+// whatever validation upstream does.
+func listQuery(atespace string) string {
+	query := fmt.Sprintf("WorkflowType = '%s' AND ExecutionStatus = 'Running'",
+		workflows.TaskWorkflowType)
+	if atespace == "" || atespace == "*" {
+		return query
+	}
+	return query + fmt.Sprintf(" AND %s = %s", workflows.AtespaceSearchAttribute,
+		quote(atespaceOf(atespace)))
+}
+
+// quote renders a value as a visibility query string literal.
+func quote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+// listExecutions walks visibility until it has at least want executions.
 func (c *Client) listExecutions(
 	ctx context.Context,
 	atespace string,
 	want int64,
 ) ([]*workflowpb.WorkflowExecutionInfo, error) {
-	query := listQuery()
-	keep := func(*workflowpb.WorkflowExecutionInfo) bool { return true }
-	if atespace != "" && atespace != "*" {
-		ns := atespaceOf(atespace)
-		keep = func(e *workflowpb.WorkflowExecutionInfo) bool {
-			got, _ := splitWorkflowID(e.GetExecution().GetWorkflowId())
-			return got == ns
-		}
-	}
+	query := listQuery(atespace)
 
 	var (
 		out   []*workflowpb.WorkflowExecutionInfo
@@ -307,11 +330,7 @@ func (c *Client) listExecutions(
 		if err != nil {
 			return nil, fmt.Errorf("listing tasks: %w", err)
 		}
-		for _, e := range resp.GetExecutions() {
-			if keep(e) {
-				out = append(out, e)
-			}
-		}
+		out = append(out, resp.GetExecutions()...)
 		token = resp.GetNextPageToken()
 		if len(token) == 0 || int64(len(out)) >= want {
 			return out, nil

@@ -28,6 +28,7 @@ import (
 	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	sdkclient "go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -160,17 +161,34 @@ func (f *fakeTemporal) ListWorkflow(
 	return resp, nil
 }
 
-// listedExecution is one row of visibility. A listing reads a task's identity
-// from its workflow ID, so that is all a row needs to carry.
+// listedExecution is one row of visibility, with the search attributes a task
+// workflow publishes about itself.
 type listedExecution struct {
-	id      string
-	started time.Time
+	id       string
+	atespace string
+	phase    string
+	started  time.Time
 }
 
 func (e listedExecution) info() *workflowpb.WorkflowExecutionInfo {
+	fields := map[string]*commonpb.Payload{}
+	for name, value := range map[string]string{
+		workflows.AtespaceSearchAttribute: e.atespace,
+		workflows.PhaseSearchAttribute:    e.phase,
+	} {
+		if value == "" {
+			continue
+		}
+		payload, err := converter.GetDefaultDataConverter().ToPayload(value)
+		if err != nil {
+			panic(err)
+		}
+		fields[name] = payload
+	}
 	return &workflowpb.WorkflowExecutionInfo{
-		Execution: &commonpb.WorkflowExecution{WorkflowId: e.id},
-		StartTime: timestamppb.New(e.started),
+		Execution:        &commonpb.WorkflowExecution{WorkflowId: e.id},
+		StartTime:        timestamppb.New(e.started),
+		SearchAttributes: &commonpb.SearchAttributes{IndexedFields: fields},
 	}
 }
 
@@ -280,6 +298,10 @@ func TestCreateSendsTheUpdateWithAStart(t *testing.T) {
 	}
 	if got := fake.startWorkflow; got != workflows.TaskWorkflowType {
 		t.Errorf("expected the workflow type, got %v", got)
+	}
+	atespace, ok := fake.startOptions.TypedSearchAttributes.GetKeyword(workflows.AtespaceKey)
+	if !ok || atespace != "team-a" {
+		t.Errorf("expected the atespace search attribute, got %q (set=%v)", atespace, ok)
 	}
 	if fake.updateOptions.UpdateName != workflows.UpdateApply {
 		t.Errorf("expected the apply update, got %q", fake.updateOptions.UpdateName)
@@ -510,26 +532,41 @@ func TestSuspendAnswersWithTheTask(t *testing.T) {
 }
 
 // The listing query is built rather than interpolated, so a value cannot steer
-// it. The atespace is matched from the workflow ID, not from the query.
+// it whatever validation upstream does.
 func TestListQuery(t *testing.T) {
-	query := listQuery()
-	if !strings.Contains(query, "WorkflowType = 'TaskWorkflow'") ||
-		!strings.Contains(query, "ExecutionStatus = 'Running'") {
-		t.Errorf("unexpected listing query: %q", query)
+	all := listQuery("")
+	if !strings.Contains(all, "WorkflowType = 'TaskWorkflow'") ||
+		!strings.Contains(all, "ExecutionStatus = 'Running'") {
+		t.Errorf("unexpected query for every atespace: %q", all)
 	}
-	if strings.Contains(query, "AxAtespace") {
-		t.Errorf("expected no custom search attribute, got %q", query)
+	if strings.Contains(all, workflows.AtespaceSearchAttribute) {
+		t.Errorf("expected no atespace filter, got %q", all)
+	}
+
+	one := listQuery("team-a")
+	if !strings.Contains(one, "AxAtespace = 'team-a'") {
+		t.Errorf("expected an atespace filter, got %q", one)
+	}
+
+	quoted := listQuery("team' OR '1'='1")
+	if !strings.Contains(quoted, "AxAtespace = 'team'' OR ''1''=''1'") {
+		t.Errorf("expected the value to be quoted, got %q", quoted)
 	}
 }
 
-// A listing returns the running task workflows without asking each one for its
-// state.
-func TestListReturnsTasksWithoutAskingEachTask(t *testing.T) {
+// A listing reads what the task published about itself. Asking every task in
+// turn is what this replaces.
+func TestListReadsVisibilityWithoutAskingEachTask(t *testing.T) {
 	started := time.Date(2026, 9, 24, 8, 0, 0, 0, time.UTC)
 	fake := &fakeTemporal{
 		executions: []listedExecution{
-			{id: "team-a/job", started: started},
-			{id: "team-a/other", started: started},
+			{id: "team-a/job", atespace: "team-a", phase: v1alpha1.PhaseRunning, started: started},
+			{
+				id:       "team-a/other",
+				atespace: "team-a",
+				phase:    v1alpha1.PhaseSuspended,
+				started:  started,
+			},
 		},
 	}
 	client := newTestClient(fake)
@@ -553,35 +590,23 @@ func TestListReturnsTasksWithoutAskingEachTask(t *testing.T) {
 		t.Errorf("expected the start time as the creation time, got %v",
 			first.GetMetadata().GetCreationTimestamp())
 	}
+	if first.GetStatus().GetPhase() != v1alpha1.PhaseRunning {
+		t.Errorf("expected the published phase, got %q", first.GetStatus().GetPhase())
+	}
 	if first.GetStatus().GetActor() != "job" {
 		t.Errorf("an actor carries the task's name, got %q", first.GetStatus().GetActor())
 	}
-}
-
-// Only the tasks in the named atespace are listed. The atespace is matched from
-// the workflow ID.
-func TestListFiltersByAtespace(t *testing.T) {
-	fake := &fakeTemporal{executions: []listedExecution{
-		{id: "team-a/job"},
-		{id: "team-b/job"},
-	}}
-	client := newTestClient(fake)
-
-	tasks, err := client.List(context.Background(), "team-a", 50, 0)
-	if err != nil {
-		t.Fatalf("List failed: %v", err)
-	}
-	if len(tasks) != 1 || tasks[0].GetMetadata().GetAtespace() != "team-a" {
-		t.Fatalf("expected only the team-a task, got %v", tasks)
+	if tasks[1].GetStatus().GetPhase() != v1alpha1.PhaseSuspended {
+		t.Errorf("expected the second task's phase, got %q", tasks[1].GetStatus().GetPhase())
 	}
 }
 
 // Paging happens over what visibility returned.
 func TestListPages(t *testing.T) {
 	fake := &fakeTemporal{executions: []listedExecution{
-		{id: "team-a/one"},
-		{id: "team-a/two"},
-		{id: "team-a/three"},
+		{id: "team-a/one", atespace: "team-a", phase: v1alpha1.PhaseRunning},
+		{id: "team-a/two", atespace: "team-a", phase: v1alpha1.PhaseRunning},
+		{id: "team-a/three", atespace: "team-a", phase: v1alpha1.PhaseRunning},
 	}}
 	client := newTestClient(fake)
 
