@@ -77,6 +77,13 @@ spec:
             - "--substrate-ca-file=/run/servicedns-ca/trust-bundle.pem"
             - "--template=default-template"
             - "--template-atespace=ax-system"
+            # To run tasks as Temporal workflows instead of reconciling them
+            # inline, add the lines below and register the search attributes
+            # first. See docs/temporal.md.
+            # - "--orchestrator=temporal"
+            # - "--temporal-address=temporal-frontend.temporal.svc.cluster.local:7233"
+            # - "--temporal-namespace=default"
+            # - "--task-queue=ax-tasks"
           env:
             - name: ATENET_ROUTER_ADDR
               value: "atenet-router.ate-system.svc.cluster.local:80"

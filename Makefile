@@ -19,7 +19,17 @@ AX_IMAGE_REPO ?= gcr.io/ax-substrate/ate-images
 TASK_RUNNER_REPO ?= $(AX_IMAGE_REPO)/ax-task-runner
 CONTAINER_CLI ?= $(shell which podman 2>/dev/null || which docker 2>/dev/null)
 
-.PHONY: all build build-binaries build-task-runner install push push-task-runner deploy deploy-server deploy-redis apply-example test clean
+.PHONY: all build build-binaries build-task-runner install push push-task-runner deploy deploy-server deploy-redis apply-example test workflowcheck proto clean
+
+# Pinned so that regenerating produces the same code as the committed files.
+PROTOC_GEN_GO_VERSION ?= v1.36.11
+PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.0
+
+# The determinism checker cannot be `go install`ed: its module carries a
+# go 1.24 directive, so the binary it produces type-checks Go 1.27 packages
+# with a 1.24 go/types, reports "package requires newer Go version" for much of
+# the standard library, and exits 0 behind those errors. See docs/temporal.md.
+WORKFLOWCHECK ?= $(shell go env GOPATH)/bin/workflowcheck-go1.27
 
 all: build
 
@@ -27,14 +37,15 @@ all: build
 ## Build Targets
 ## --------------------------------------
 
-# Build all local binaries (ax CLI, server)
+# Build all local binaries (ax CLI, server, task import)
 build: build-binaries
 
 build-binaries:
-	@echo "==> Building local binaries (ax, ax-server)..."
+	@echo "==> Building local binaries (ax, ax-server, ax-migrate-tasks)..."
 	@mkdir -p bin
 	go build -trimpath -ldflags="-s -w" -o bin/ax ./cmd/ax
 	go build -trimpath -ldflags="-s -w" -o bin/ax-server ./cmd/ax-server
+	go build -trimpath -ldflags="-s -w" -o bin/ax-migrate-tasks ./cmd/ax-migrate-tasks
 
 # Install the ax CLI into $(go env GOPATH)/bin
 install:
@@ -86,6 +97,31 @@ apply-example:
 test:
 	@echo "==> Running tests..."
 	go test -v ./...
+
+# Not part of `test`: the tool has to be built by hand until the released one
+# works on Go 1.27.
+workflowcheck:
+	@echo "==> Checking workflow determinism..."
+	@test -x "$(WORKFLOWCHECK)" || { \
+		echo "$(WORKFLOWCHECK) is missing. Build it as described in docs/temporal.md."; \
+		exit 1; \
+	}
+	$(WORKFLOWCHECK) -test=false ./internal/orchestration/...
+
+## --------------------------------------
+## Code Generation
+## --------------------------------------
+
+# Regenerate the API types. protoc itself is not pinned here, and the version
+# it stamps into the generated header is whatever is on PATH.
+proto:
+	@echo "==> Generating pkg/apis/v1alpha1 from ax.proto..."
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+	PATH="$$(go env GOPATH)/bin:$$PATH" protoc \
+		--go_out=. --go_opt=module=github.com/google/ax \
+		--go-grpc_out=. --go-grpc_opt=module=github.com/google/ax \
+		pkg/apis/v1alpha1/ax.proto
 
 clean:
 	@echo "==> Cleaning build artifacts..."

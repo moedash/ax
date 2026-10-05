@@ -16,6 +16,9 @@ The control plane does not run `spec.command` as the container entrypoint. It al
 | Container command | `/usr/local/bin/ax-task-runner`, always |
 | `AX_TASK_YAML` | The `Task` launch configuration as YAML, excluding status |
 | `AX_WORKSPACES_YAML` | Every bound `Workspace` resource as a multi-document YAML stream, in the task's binding order |
+| `AX_WORKFLOW_ID` | The task's workflow, which is where the runner reports how the task command finished. Only set when the control plane runs with `--orchestrator=temporal --sandbox-report-completion` |
+| `AX_TEMPORAL_ADDRESS`, `AX_TEMPORAL_NAMESPACE` | Where that report goes, under the same flags |
+| `AX_SANDBOX_GENERATION` | Which of the task's sandboxes this is, under the same flags. The report carries it, so a report from a sandbox the task has since replaced is not taken for the current one |
 | `spec.env` entries | Each one set directly in the container environment |
 | `GEMINI_API_KEY` | Set when the atespace has a Gemini credential configured |
 | Volume | A durable directory mounted at `/workspace` |
@@ -40,7 +43,9 @@ The `/workspace` volume is what survives suspend and resume. Agent Substrate sna
 
 **Run the command and supervise it.** Start `spec.command` as a child process with the first workspace as its working directory. Give it `AX_METADATA_URL` pointing at your own HTTP server plus every `spec.env` entry. Put it in its own process group so you can signal everything it spawns.
 
-**Stay up after the command exits.** The runner is PID 1, and the container lives as long as it does. If the runner exits when the command does, the metadata server goes with it and `ax ssh` stops working. Log the exit status and keep serving until you are told to stop. The control plane does not currently read the command's exit status back from the container.
+**Stay up after the command exits.** The runner is PID 1, and the container lives as long as it does. If the runner exits when the command does, the metadata server goes with it and `ax ssh` stops working. Log the exit status and keep serving until you are told to stop.
+
+**Report the exit status, if you were told where.** When the command finishes on its own and `AX_WORKFLOW_ID` is set, send the `complete` update to that workflow at `AX_TEMPORAL_ADDRESS`, carrying the exit code and `AX_SANDBOX_GENERATION`. That is what moves the task to `Completed` and fills in `status.exitCode`. Those variables are absent unless the control plane runs with `--orchestrator=temporal --sandbox-report-completion`, and then there is nothing to report to: log the exit code and carry on. An exit you caused yourself by forwarding `SIGTERM` is not a completion; the sandbox is being stopped or suspended, and reporting it would mark the task `Completed` with exit code `-1`. Keep the report best effort: the sandbox has to stay up and inspectable whether or not the control plane can be reached. The default runner gives the update five seconds, then falls back to a signal of the same name with five seconds of its own, so a frontend with no worker behind it still gets the signal.
 
 **Shut down cleanly on `SIGTERM`.** Stop and suspend both deliver `SIGTERM` to PID 1. Forward it to the command's process group, wait a bounded grace period, then `SIGKILL` whatever is left. Flush anything the agent needs to survive a resume before you exit.
 
