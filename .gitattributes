@@ -1,0 +1,4 @@
+# Generated files. Collapsed in diffs, excluded from language stats.
+internal/orchestration/workflows/testdata/*.json linguist-generated=true
+pkg/apis/v1alpha1/ax.pb.go linguist-generated=true
+pkg/apis/v1alpha1/ax_grpc.pb.go linguist-generated=true
