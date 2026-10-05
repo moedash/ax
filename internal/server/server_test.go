@@ -169,7 +169,6 @@ func TestServerGRPC(t *testing.T) {
 		t.Errorf("expected task phase to be 'Running', got %q", resTask.Status.Phase)
 	}
 
-
 	// 5. Workspaces
 	ws, err = client.GetWorkspace(ctx, &v1alpha1.GetWorkspaceRequest{Atespace: "default", Name: "grpc-ws"})
 	if err != nil {
