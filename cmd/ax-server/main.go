@@ -45,9 +45,15 @@ func main() {
 		substratePlaintext      bool
 		defaultTemplate         string
 		defaultTemplateAtespace string
+		orchestrator            string
+		temporalOpts            temporalOptions
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
+	flag.StringVar(&orchestrator, "orchestrator", orchestratorDirect,
+		"How task calls reach Substrate: \"direct\" reconciles inline under a Redis lock, "+
+			"\"temporal\" runs each task as a Temporal workflow (see docs/temporal.md)")
+	temporalOpts.bindFlags(flag.CommandLine)
 	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address")
 	flag.StringVar(&redisPassword, "redis-password", "", "Redis password")
 	flag.StringVar(&substrateEndpoint, "substrate-endpoint", "api.ate-system.svc.cluster.local:443", "Agent Substrate Control API endpoint")
@@ -69,15 +75,26 @@ func main() {
 	if envPass := os.Getenv("REDIS_PASSWORD"); envPass != "" {
 		redisPassword = envPass
 	}
+	if env := os.Getenv("AX_ORCHESTRATOR"); env != "" {
+		orchestrator = env
+	}
+	temporalOpts.applyEnv()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+
+	if orchestrator != orchestratorDirect && orchestrator != orchestratorTemporal {
+		slog.Error("unknown orchestrator", "orchestrator", orchestrator,
+			"want", []string{orchestratorDirect, orchestratorTemporal})
+		os.Exit(1)
+	}
 
 	slog.Info("starting ax-server",
 		"listenAddr", listenAddr,
 		"redisAddr", redisAddr,
 		"substrateEndpoint", substrateEndpoint,
 		"template", defaultTemplate,
+		"orchestrator", orchestrator,
 	)
 
 	rClient := goredis.NewClient(&goredis.Options{
@@ -105,10 +122,35 @@ func main() {
 		reconciler = controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace)
 	}
 
-	srv := server.NewServer(rStore, server.Options{
+	serverOpts := server.Options{
 		Locker:     rLocker,
 		Reconciler: reconciler,
-	})
+	}
+	stopTemporal := func() {}
+	if orchestrator == orchestratorTemporal {
+		// The worker runs in this process, so without Substrate it would fail
+		// every task's activities rather than reconcile nothing.
+		if subClient == nil {
+			slog.Error("the temporal orchestrator needs a substrate client")
+			os.Exit(1)
+		}
+		slog.Info("tasks run as temporal workflows",
+			"temporalAddress", temporalOpts.address,
+			"temporalNamespace", temporalOpts.namespace,
+			"taskQueue", temporalOpts.taskQueue,
+			"resyncInterval", temporalOpts.resyncInterval,
+		)
+		tasks, stop, err := startTemporal(context.Background(), temporalOpts, subClient, logger)
+		if err != nil {
+			slog.Error("could not start the temporal orchestrator", "error", err)
+			os.Exit(1)
+		}
+		stopTemporal = stop
+		serverOpts.Tasks = tasks
+		serverOpts.WatchPollInterval = temporalOpts.watchInterval
+	}
+
+	srv := server.NewServer(rStore, serverOpts)
 
 	httpServer := &http.Server{
 		Addr:    listenAddr,
@@ -134,4 +176,6 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+	// Stopped after the API, so no task call is taken that nothing will drive.
+	stopTemporal()
 }

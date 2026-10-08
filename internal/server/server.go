@@ -20,8 +20,10 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/ax/internal/lock"
+	"github.com/google/ax/internal/orchestration"
 	"github.com/google/ax/internal/store"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/grpc"
@@ -40,15 +42,23 @@ type Reconciler interface {
 type Options struct {
 	Locker     lock.Locker
 	Reconciler Reconciler
+	// Tasks, when set, routes every task RPC through Temporal workflows instead
+	// of the Reconciler. The configuration kinds stay in the store either way.
+	Tasks orchestration.Tasks
+	// WatchPollInterval is how often WatchTask asks a task workflow for its
+	// state. Zero uses defaultWatchPollInterval. It is only read with Tasks.
+	WatchPollInterval time.Duration
 }
 
 // Server provides the gRPC API for AX.
 type Server struct {
 	v1alpha1.UnimplementedAXServer
-	store      store.Store
-	locker     lock.Locker
-	reconciler Reconciler
-	grpcServer *grpc.Server
+	store             store.Store
+	locker            lock.Locker
+	reconciler        Reconciler
+	tasks             orchestration.Tasks
+	watchPollInterval time.Duration
+	grpcServer        *grpc.Server
 }
 
 // NewServer creates a new AX API server.
@@ -63,10 +73,15 @@ func NewServer(s store.Store, opts ...Options) *Server {
 	}
 
 	srv := &Server{
-		store:      s,
-		locker:     locker,
-		reconciler: opt.Reconciler,
-		grpcServer: grpc.NewServer(),
+		store:             s,
+		locker:            locker,
+		reconciler:        opt.Reconciler,
+		tasks:             opt.Tasks,
+		watchPollInterval: opt.WatchPollInterval,
+		grpcServer:        grpc.NewServer(),
+	}
+	if srv.watchPollInterval <= 0 {
+		srv.watchPollInterval = defaultWatchPollInterval
 	}
 	v1alpha1.RegisterAXServer(srv.grpcServer, srv)
 	return srv
@@ -105,6 +120,9 @@ func (s *Server) GetTask(ctx context.Context, req *v1alpha1.GetTaskRequest) (*v1
 	if atespace == "" {
 		atespace = "default"
 	}
+	if s.tasks != nil {
+		return s.getTaskWorkflow(ctx, atespace, req.Name)
+	}
 	task, err := s.store.GetTask(ctx, atespace, req.Name)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -127,6 +145,9 @@ func (s *Server) ListTasks(ctx context.Context, req *v1alpha1.ListTasksRequest) 
 		if req.Offset >= 0 {
 			offset = req.Offset
 		}
+	}
+	if s.tasks != nil {
+		return s.listTaskWorkflows(ctx, atespace, limit, offset)
 	}
 	tasks, err := s.store.ListTasks(ctx, atespace, limit, offset)
 	if err != nil {
@@ -152,6 +173,13 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 		task.Metadata.Atespace = atespace
 	}
 	taskName := task.Metadata.GetName()
+
+	if s.tasks != nil {
+		if task.Metadata.CreationTimestamp == nil {
+			task.Metadata.CreationTimestamp = timestamppb.Now()
+		}
+		return s.createTaskWorkflow(ctx, task)
+	}
 
 	// Acquire exclusive lock for this task
 	unlock, err := s.locker.Lock(ctx, "task", atespace, taskName)
@@ -207,6 +235,10 @@ func (s *Server) DeleteTask(ctx context.Context, req *v1alpha1.DeleteTaskRequest
 		atespace = "default"
 	}
 	taskName := req.Name
+
+	if s.tasks != nil {
+		return s.deleteTaskWorkflow(ctx, atespace, taskName)
+	}
 
 	// Acquire exclusive lock for this task
 	unlock, err := s.locker.Lock(ctx, "task", atespace, taskName)
@@ -264,6 +296,10 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 	}
 	taskName := req.Name
 
+	if s.tasks != nil {
+		return s.suspendTaskWorkflow(ctx, atespace, taskName)
+	}
+
 	// Acquire exclusive lock for this task
 	unlock, err := s.locker.Lock(ctx, "task", atespace, taskName)
 	if err != nil {
@@ -311,6 +347,10 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 		atespace = "default"
 	}
 	taskName := req.Name
+
+	if s.tasks != nil {
+		return s.resumeTaskWorkflow(ctx, atespace, taskName)
+	}
 
 	// Acquire exclusive lock for this task
 	unlock, err := s.locker.Lock(ctx, "task", atespace, taskName)
@@ -375,6 +415,9 @@ func (s *Server) WatchTask(req *v1alpha1.WatchTaskRequest, stream grpc.ServerStr
 	atespace := req.Atespace
 	if atespace == "" {
 		atespace = "default"
+	}
+	if s.tasks != nil {
+		return s.watchTaskWorkflow(atespace, req.Name, stream)
 	}
 	ctx := stream.Context()
 	ch, closer, err := s.store.WatchTask(ctx, atespace, req.Name)
@@ -599,4 +642,3 @@ func defaultMetadata(meta *v1alpha1.ObjectMeta, existing func(atespace, name str
 	}
 	return meta
 }
-

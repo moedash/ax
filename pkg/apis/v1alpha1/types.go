@@ -37,9 +37,50 @@ const (
 
 	DefaultTaskImage = "gcr.io/ax-substrate/ate-images/ax-task-runner"
 
+	// DefaultAtespace holds resources whose manifest leaves the atespace empty.
+	DefaultAtespace = "default"
+)
+
+// Environment variables AX sets in every task container. They are the contract
+// between the control plane and whatever runs as PID 1 inside the sandbox.
+const (
+	// EnvTaskYAML carries the Task resource, without its status.
+	EnvTaskYAML = "AX_TASK_YAML"
+	// EnvWorkspacesYAML carries every bound Workspace as a multi-document YAML
+	// stream, in binding order.
+	EnvWorkspacesYAML = "AX_WORKSPACES_YAML"
+)
+
+// Task phases reported on status.phase. A task's phase is derived from the state
+// of its sandbox, so the same task can move back and forth between them.
+const (
+	// PhasePending marks a task whose sandbox is still being provisioned.
+	PhasePending = "Pending"
+	// PhaseRunning marks a task whose actor is running on a worker.
+	PhaseRunning = "Running"
+	// PhaseSuspended marks a task whose actor has been checkpointed and stopped.
+	PhaseSuspended = "Suspended"
+	// PhaseFailed marks a task whose sandbox could not be provisioned.
+	PhaseFailed = "Failed"
 	// PhaseTerminating marks a task whose deletion has been requested and whose
 	// actor is being torn down. The record disappears once cleanup completes.
 	PhaseTerminating = "Terminating"
+)
+
+// Condition types reported on status.conditions.
+const (
+	// ConditionReady reports whether the task as a whole is ready to do work: its
+	// actor is running and the workspace inside it has finished setting up.
+	ConditionReady = "Ready"
+	// ConditionWorkspaceReady reports whether the workspace inside the actor has
+	// finished setting up.
+	ConditionWorkspaceReady = "WorkspaceReady"
+)
+
+// Condition status values.
+const (
+	ConditionTrue  = "True"
+	ConditionFalse = "False"
 )
 
 // YAML encoding.
@@ -253,6 +294,12 @@ func (s *TaskSpec) WorkspacePaths() []string {
 // MaxNameLength is the longest name or atespace a resource may have.
 const MaxNameLength = 63
 
+// MaxTaskNameLength is the longest a task name may be. A task's actor template
+// is named after the task with a suffix of fourteen characters, "-tmpl-" and
+// eight hex digits, and Substrate resource names are DNS labels, so the suffix
+// comes out of the task name's budget.
+const MaxTaskNameLength = MaxNameLength - 14
+
 var nameRegexp = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
 // ValidateName reports whether s can be used as a resource name or atespace: a
@@ -309,6 +356,10 @@ func ValidateModel(m *Model) error {
 func ValidateTask(t *Task) error {
 	if err := ValidateObjectMeta(t.GetMetadata()); err != nil {
 		return err
+	}
+	if name := t.GetMetadata().GetName(); len(name) > MaxTaskNameLength {
+		return fmt.Errorf("metadata.name %q is too long: a task name is at most %d characters, "+
+			"so that its actor template name fits a DNS label", name, MaxTaskNameLength)
 	}
 	spec := t.GetSpec()
 	if spec == nil {

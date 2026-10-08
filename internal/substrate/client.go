@@ -479,6 +479,24 @@ func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string) er
 	}
 }
 
+// RevertActor puts a crashed actor back on its last snapshot. The actor comes
+// back suspended and keeps its workspace, which a delete and recreate would
+// lose.
+func (c *Client) RevertActor(
+	ctx context.Context, atespace, actorName string,
+) (*ateapipb.Actor, error) {
+	resp, err := c.control.RevertActor(ctx, &ateapipb.RevertActorRequest{
+		Actor: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     actorName,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reverting actor %s/%s: %w", atespace, actorName, err)
+	}
+	return resp.GetActor(), nil
+}
+
 // ListActorTemplates returns all ActorTemplates in the given atespace.
 func (c *Client) ListActorTemplates(ctx context.Context, atespace string) ([]*ateapipb.ActorTemplate, error) {
 	resp, err := c.control.ListActorTemplates(ctx, &ateapipb.ListActorTemplatesRequest{Atespace: atespace})
@@ -505,5 +523,3 @@ func (c *Client) DeleteActorTemplate(ctx context.Context, atespace, templateName
 	}
 	return nil
 }
-
-

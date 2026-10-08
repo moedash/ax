@@ -110,6 +110,10 @@ message TaskStatus {
   PendingApproval pending_approval = 5;
   UsageStats usage = 6;
   repeated Condition conditions = 7;
+  // exit_code is the status the task command exited with, reported by the
+  // runner inside the sandbox. It is set only in the Completed phase, and is
+  // optional so that a zero exit status is distinguishable from an absent one.
+  optional int32 exit_code = 8;
 }
 
 message PendingApproval {
