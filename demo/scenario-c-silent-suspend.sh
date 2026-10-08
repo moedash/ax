@@ -15,21 +15,22 @@
 
 # Scenario C. A silent suspend divergence.
 #
-# A task is driven to Running, then a suspend is asked for while SuspendActor
-# fails. The direct path swallows the failure, reports Suspended, and the record
-# now disagrees with the actor, which is still running. The Temporal path surfaces
-# the failure and does not report a suspend it did not perform.
-#
-# The suspend fault is on the whole time for direct, which just logs it. Temporal
-# refuses to report a suspend it could not do, so it cannot even be driven into a
-# running state with the fault on. The fault is therefore turned on only once the
-# task is running, which is itself the point in Temporal's favor.
+# Both paths run the same steps. Drive a task to Running, make SuspendActor fail,
+# ask for a suspend, then let Substrate recover. The direct path says the suspend
+# worked while the actor keeps running, and the record stays wrong after Substrate
+# comes back. The Temporal path makes no claim it can't back, keeps retrying the
+# suspend, and finishes it once Substrate recovers.
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 TASK="suspend-task"
-DIRECT_RESULT=""
-TEMPORAL_RESULT=""
+# Set by suspend_under_fault: what each side reported while the fault was on.
+SUSPEND_EXIT=""
+PHASE_DURING=""
+ACTOR_DURING=""
+# Each result reads exit/phase-during/actor-during/phase-after/actor-after.
+D_RESULT=""
+T_RESULT=""
 
 # drive_to_running applies the task and resumes it to Running.
 drive_to_running() {
@@ -41,63 +42,71 @@ drive_to_running() {
     || note "phase is $(task_phase "${TASK}")"
 }
 
-run_direct() {
-  step "DIRECT path (--orchestrator=direct)"
-  start_redis
-  # The suspend fault is on the whole time. The direct path only logs it.
-  start_fake --fail-suspend
-  start_server direct
-
+# suspend_under_fault runs the steps both paths share: reach Running, make
+# SuspendActor fail, ask for a suspend, and record what each side then reports.
+suspend_under_fault() {
   sub "drive the task to Running"
   drive_to_running
   ok "task phase is $(task_phase "${TASK}"), actor is $(actor_state "${TASK}")"
 
-  sub "suspend the task while SuspendActor is failing"
-  if run ax suspend task "${TASK}"; then
-    note "suspend returned success (exit 0)"
-  else
-    note "suspend returned an error"
-  fi
+  sub "make SuspendActor fail on the fake"
+  knob fail-suspend=true
 
-  local phase; phase="$(task_phase "${TASK}")"
-  local state; state="$(actor_state "${TASK}")"
-  echo "ax says phase=${phase}; fake says actor=${state}"
+  sub "ask for a suspend while SuspendActor is failing"
+  SUSPEND_EXIT=0
+  run ax suspend task "${TASK}" || SUSPEND_EXIT=$?
+  PHASE_DURING="$(task_phase "${TASK}")"
+  ACTOR_DURING="$(actor_state "${TASK}")"
+  echo "suspend exit=${SUSPEND_EXIT}; ax says phase=${PHASE_DURING};" \
+    "fake says actor=${ACTOR_DURING}"
+}
+
+run_direct() {
+  step "DIRECT path (--orchestrator=direct)"
+  start_redis
+  start_fake
+  start_server direct
+  suspend_under_fault
+
+  sub "Substrate recovers (fault off); watch whether the record catches up"
+  knob fail-suspend=false
+  local waited=0
+  while (( waited < 15 )); do
+    echo "  t=${waited}s phase=$(task_phase "${TASK}") actor=$(actor_state "${TASK}")"
+    sleep 5; waited=$((waited + 5))
+  done
   note "fake: $(introspect)"
 
-  DIRECT_RESULT="ax=${phase}, actor=${state}"
+  D_RESULT="${SUSPEND_EXIT}/${PHASE_DURING}/${ACTOR_DURING}"
+  D_RESULT+="/$(task_phase "${TASK}")/$(actor_state "${TASK}")"
   stop_stack
 }
 
 run_temporal() {
   step "TEMPORAL path (--orchestrator=temporal)"
   start_redis
-  # No fault yet, so the task can be driven to Running cleanly.
   start_fake
   start_temporal
   start_server temporal
-
-  sub "drive the task to Running"
-  drive_to_running
-  ok "task phase is $(task_phase "${TASK}"), actor is $(actor_state "${TASK}")"
-
-  sub "turn the suspend fault on now that the task is running"
-  knob fail-suspend=true
-
-  sub "suspend the task while SuspendActor is failing"
-  if run ax suspend task "${TASK}"; then
-    note "suspend returned success (exit 0)"
-  else
-    note "suspend returned an error (exit non-zero), which is the point"
+  suspend_under_fault
+  if (( SUSPEND_EXIT != 0 )); then
+    # The CLI waits 10s for the suspend and then gives up. Its message says no
+    # worker answered, but the worker is fine and still retrying the suspend.
+    note "the CLI stopped waiting; the workflow is still retrying SuspendActor"
   fi
 
-  local phase; phase="$(task_phase "${TASK}")"
-  local state; state="$(actor_state "${TASK}")"
-  echo "ax says phase=${phase}; fake says actor=${state}"
-  note "fake: $(introspect)"
-  # Let the background retry stop mattering before teardown.
+  sub "Substrate recovers (fault off); the workflow's next retry lands"
   knob fail-suspend=false
+  if wait_for_phase "${TASK}" Suspended 90; then
+    ok "the suspend finished on its own"
+  else
+    err "the suspend did not finish; phase is $(task_phase "${TASK}")"
+  fi
+  note "fake: $(introspect)"
+  note "highest SuspendActor attempt in the ax-server log: $(max_attempt SuspendActor)"
 
-  TEMPORAL_RESULT="ax=${phase}, actor=${state}"
+  T_RESULT="${SUSPEND_EXIT}/${PHASE_DURING}/${ACTOR_DURING}"
+  T_RESULT+="/$(task_phase "${TASK}")/$(actor_state "${TASK}")"
   stop_stack
 }
 
@@ -110,8 +119,15 @@ main() {
   run_temporal
 
   step "VERDICT"
-  echo "direct:   ${DIRECT_RESULT} -> reported Suspended, actor still RUNNING (divergence)"
-  echo "temporal: ${TEMPORAL_RESULT} -> suspend failed loudly, no false success"
+  check direct "${D_RESULT}" \
+    '^0/Suspended/ACTOR_STATE_RUNNING/Suspended/ACTOR_STATE_RUNNING$' \
+    "said yes. The record says Suspended, but the actor kept RUNNING and still is." \
+    "got ${D_RESULT}, expected 0/Suspended/RUNNING/Suspended/RUNNING"
+  check temporal "${T_RESULT}" \
+    '^[1-9][0-9]*/Running/ACTOR_STATE_RUNNING/Suspended/ACTOR_STATE_SUSPENDED$' \
+    "claimed nothing while Substrate failed, then finished. Record and actor agree." \
+    "got ${T_RESULT}, expected nonzero/Running/RUNNING/Suspended/SUSPENDED"
+  summarize "the direct record lies about the actor. The Temporal record never does."
 }
 
 main "$@"

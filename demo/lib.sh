@@ -212,7 +212,7 @@ introspect() { curl -s "${FAKE_HTTP}/introspect"; }
 # place a state string follows an actor name.
 actor_state() {
   introspect | grep -oE "\"$1\":\"ACTOR_STATE_[A-Z]+\"" \
-    | grep -oE "ACTOR_STATE_[A-Z]+" | head -1
+    | grep -oE "ACTOR_STATE_[A-Z]+" | head -1 || true
 }
 
 # knob flips a fault on the running fake, for example knob fail-suspend=true.
@@ -223,7 +223,7 @@ knob() { curl -s -X POST "${FAKE_HTTP}/knobs?$1" >/dev/null; }
 # task_phase prints the phase ax reports for a task, on either path. The list
 # view carries no phase on the Temporal path, so this reads the task itself.
 task_phase() {
-  ax describe task "$1" 2>/dev/null | awk '/^Phase:/{print $2}'
+  ax describe task "$1" 2>/dev/null | awk '/^Phase:/{print $2}' || true
 }
 
 # wait_for_phase polls until a task reaches a phase or the timeout runs out.
@@ -234,4 +234,40 @@ wait_for_phase() {
     sleep 2; waited=$((waited + 2))
   done
   return 1
+}
+
+# max_attempt prints the highest attempt ax-server logged for an activity type,
+# so a verdict can show a retry happened instead of assuming it.
+max_attempt() {
+  grep -h "ActivityType=$1" "${WORKDIR}/ax-server.log" 2>/dev/null \
+    | grep -oE 'Attempt=[0-9]+' | cut -d= -f2 | sort -n | tail -1 || true
+}
+
+# --- verdicts ---
+
+# REPRODUCED drops to 0 as soon as one observation misses its expectation, so the
+# verdict reports what happened, not what the scenario hoped for.
+REPRODUCED=1
+
+# check prints one verdict line. It matches what was observed against the
+# expected pattern and picks the matching message.
+check() {
+  local label="$1" got="$2" want="$3" good="$4" bad="$5"
+  if [[ "${got}" =~ ${want} ]]; then
+    printf '%s%-9s %s%s\n' "${GREEN}" "${label}:" "${good}" "${RESET}"
+  else
+    printf '%s%-9s %s%s\n' "${RED}" "${label}:" "${bad}" "${RESET}"
+    REPRODUCED=0
+  fi
+}
+
+# summarize claims the contrast only when every check held, and exits non-zero
+# otherwise so a broken run can't pass for a good one.
+summarize() {
+  if (( REPRODUCED )); then
+    ok "reproduced: $1"
+  else
+    err "did not reproduce; read the lines above"
+    exit 1
+  fi
 }

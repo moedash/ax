@@ -16,14 +16,17 @@
 # Scenario A. A transient Substrate blip.
 #
 # The fake fails the first CreateActor call and serves every call after it. On
-# the direct path the one failed call fails the task for good. On the Temporal
-# path the activity is retried and the task recovers.
+# the direct path the one failed call fails the task for good, and applying it
+# again is rejected because a task is immutable. On the Temporal path the
+# activity is retried and the task recovers.
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 TASK="blip-task"
 DIRECT_RESULT=""
+DIRECT_REAPPLY=""
 TEMPORAL_RESULT=""
+TEMPORAL_ATTEMPT=""
 
 run_direct() {
   step "DIRECT path (--orchestrator=direct)"
@@ -40,16 +43,21 @@ run_direct() {
     note "apply returned an error (the direct path gives up inline)"
   fi
 
-  local phase; phase="$(task_phase "${TASK}")"
   sub "ax get task right after apply"
   run ax get task "${TASK}" | grep -E 'phase:|actor:' || true
   sleep 2
   sub "and again a moment later, to show nothing re-drives it"
-  local phase2; phase2="$(task_phase "${TASK}")"
-  echo "phase stays ${phase2}"
-  note "fake: $(introspect)"
+  DIRECT_RESULT="$(task_phase "${TASK}")"
+  echo "phase stays ${DIRECT_RESULT}"
 
-  DIRECT_RESULT="${phase2}"
+  # The blip is over, so this is the first fix an operator would reach for.
+  sub "the blip is over; try the obvious fix and apply the task again"
+  if run ax apply -f "${WORKDIR}/task.yaml"; then
+    DIRECT_REAPPLY="accepted"
+  else
+    DIRECT_REAPPLY="rejected"
+  fi
+  note "fake: $(introspect)"
   stop_stack
 }
 
@@ -77,8 +85,8 @@ run_temporal() {
     err "task did not reach Running; phase is $(task_phase "${TASK}")"
   fi
   note "fake: $(introspect)"
-  note "retry proof: EnsureActor $(grep 'ActivityType=EnsureActor' "${WORKDIR}/ax-server.log" \
-    | grep -oE 'Attempt=[0-9]+' | sort -u | tr '\n' ' ')in the log"
+  TEMPORAL_ATTEMPT="$(max_attempt EnsureActor)"
+  note "highest EnsureActor attempt in the ax-server log: ${TEMPORAL_ATTEMPT:-none}"
 
   TEMPORAL_RESULT="$(task_phase "${TASK}")"
   stop_stack
@@ -93,8 +101,13 @@ main() {
   run_temporal
 
   step "VERDICT"
-  echo "direct:   ${DIRECT_RESULT} (gave up)"
-  echo "temporal: ${TEMPORAL_RESULT} (retried, recovered)"
+  check direct "${DIRECT_RESULT}/${DIRECT_REAPPLY}" '^Failed/rejected$' \
+    "Failed after one blip. Re-applying is rejected, so a human must delete and redo it." \
+    "got ${DIRECT_RESULT:-none}/${DIRECT_REAPPLY:-none}, expected Failed/rejected"
+  check temporal "${TEMPORAL_RESULT}/${TEMPORAL_ATTEMPT:-0}" '^Running/([2-9]|[1-9][0-9]+)$' \
+    "Running. EnsureActor failed once, was retried, and the task recovered on its own." \
+    "got ${TEMPORAL_RESULT:-none} with ${TEMPORAL_ATTEMPT:-0} attempts, expected Running and 2+"
+  summarize "the same blip ended the task on direct and was absorbed on Temporal."
 }
 
 main "$@"

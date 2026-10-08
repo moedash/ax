@@ -51,6 +51,14 @@ AX_DEMO_FAKE_CONTROL_PORT=9101 AX_DEMO_TEMPORAL_PORT=7244 \
   demo/scenario-a-transient-blip.sh
 ```
 
+## How a verdict is decided
+
+Each verdict is computed from what the run observed: the phase `ax` reports, the
+actor state the fake holds, CLI exit codes, and retry attempts in the
+`ax-server` log. A verdict line is green when the observation matches the
+expected contrast and red when it doesn't. If any check misses, the script says
+so and exits non-zero, so a bad run can't pass for a good one.
+
 ## The scenarios
 
 ### A. A transient Substrate blip
@@ -59,13 +67,15 @@ The fake fails the first `CreateActor` call and serves every call after it
 (`--fail-create-actor-times 1`).
 
 - **direct.** `ax apply` reconciles inline. The one failed call ends the task as
-  `Failed`, and nothing re-drives it. It stays `Failed`.
+  `Failed`, and nothing re-drives it. Applying the task again is rejected,
+  because a task is immutable. Recovery needs a human to delete it and start
+  over.
 - **temporal.** The `EnsureActor` activity is retried, the second attempt
   succeeds, and the task settles. `ax resume` then takes it to `Running`.
 
 ```
-direct:   Failed (gave up)
-temporal: Running (retried, recovered)
+direct:   Failed after one blip. Re-applying is rejected, so a human must delete and redo it.
+temporal: Running. EnsureActor failed once, was retried, and the task recovered on its own.
 ```
 
 ### B. A crash mid-provision
@@ -74,11 +84,15 @@ The fake makes every resume slow (`--delay-resume`), which opens a window to kil
 `ax-server` while it is placing the actor on a worker.
 
 - **direct.** The resume runs inline inside the RPC. Kill `ax-server` mid-resume
-  and nothing re-drives the half-finished placement. After a restart the task
-  sits where it was, `Suspended`.
-- **temporal.** The workflow is the state. Kill `ax-server` mid-resume, restart
-  it, and the restarted worker picks the resume back up and the task reaches
-  `Running`.
+  and the resume dies with the process. After a restart the task is still
+  `Suspended` and the actor never moved. Nothing picks the resume back up, so
+  someone has to notice and run it again.
+- **temporal.** The resume is a step of the task's workflow. Kill `ax-server`
+  mid-resume, restart it, and the restarted worker finishes the resume. The task
+  reaches `Running`.
+
+In both modes the CLI that asked for the resume sees the crash. The difference
+is whether the work it asked for still happens.
 
 Recovery on the Temporal path waits out the abandoned activity's heartbeat
 timeout before Temporal reschedules it, which is about a minute. The script
@@ -87,31 +101,31 @@ window has been used, the script turns the slow resume off, so the recovery you
 watch is the Temporal retry and not the artificial delay.
 
 ```
-direct:   stuck Suspended (no re-drive)
-temporal: Running (workflow resumed)
+direct:   Suspended. The resume died with ax-server and nothing finished it.
+temporal: Running. The restarted worker finished the resume that was in flight.
 ```
 
 ### C. A silent suspend divergence
 
-A task is driven to `Running`, then a suspend is asked for while `SuspendActor`
-fails (`--fail-suspend`).
+Both paths run the same steps. Drive a task to `Running`, make `SuspendActor`
+fail, ask for a suspend, then turn the fault off as if Substrate recovered.
 
 - **direct.** The reconciler logs the failed suspend and reports `Suspended`
-  anyway. `ax suspend` exits 0. The record now says `Suspended` while the actor
-  is still `RUNNING` on the fake and was never in the suspended set. The record
-  lies.
-- **temporal.** The suspend is an activity whose failure is surfaced. `ax suspend`
-  exits non-zero, and the phase does not become `Suspended`. No false success.
+  anyway. `ax suspend` exits 0. The record says `Suspended` while the actor is
+  still `RUNNING` on the fake. After Substrate recovers, nothing reconciles the
+  two. The record stays wrong.
+- **temporal.** The suspend is an activity, and it keeps retrying. `ax suspend`
+  stops waiting after 10s and exits non-zero, and the phase stays `Running`.
+  Once the fault is off, the next retry lands, and the task ends `Suspended`
+  with the actor `SUSPENDED`. Record and actor agree.
 
-The fault timing differs on purpose. On the direct path the fault is on the whole
-time and the path just logs it. The Temporal path refuses to report a suspend it
-did not perform, so it cannot even be driven into a running state with the fault
-on. The fault is turned on only once the task is running, which is itself the
-point in Temporal's favor.
+When `ax suspend` gives up waiting, it prints `no worker answered`. The worker is
+fine. The suspend is still being retried. The message comes from the CLI's wait
+timing out, and it is misleading here.
 
 ```
-direct:   reported Suspended, actor still RUNNING (divergence)
-temporal: suspend failed loudly, no false success
+direct:   said yes. The record says Suspended, but the actor kept RUNNING and still is.
+temporal: claimed nothing while Substrate failed, then finished. Record and actor agree.
 ```
 
 ## The fake's fault knobs

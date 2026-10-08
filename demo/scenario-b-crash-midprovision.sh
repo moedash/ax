@@ -16,9 +16,11 @@
 # Scenario B. The control plane crashes mid-provision.
 #
 # The fake makes every resume slow, so there is a window to kill ax-server while
-# it is placing the actor on a worker. On the direct path nothing re-drives the
-# half-finished resume, so the task sits where it was. On the Temporal path the
-# workflow is the state, so a restarted worker picks the resume back up.
+# it is placing the actor on a worker. In both modes the CLI that asked for the
+# resume sees the crash. What differs is the work. On the direct path the resume
+# ran inside the RPC and died with the process, so the task stays Suspended until
+# someone notices and asks again. On the Temporal path the resume is a workflow
+# step, so the restarted worker finishes it.
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
@@ -31,7 +33,9 @@ KILL_AFTER="${AX_DEMO_KILL_AFTER:-6}"
 # is rescheduled after its heartbeat timeout, which is about a minute.
 RECOVER_TIMEOUT="${AX_DEMO_RECOVER_TIMEOUT:-150}"
 DIRECT_RESULT=""
+DIRECT_ACTOR=""
 TEMPORAL_RESULT=""
+TEMPORAL_ACTOR=""
 
 # drive_to_resume applies the task, waits for Suspended, then kicks off a resume
 # in the background and crashes ax-server while that resume is in flight.
@@ -62,15 +66,17 @@ run_direct() {
 
   sub "restart ax-server (direct)"
   start_server direct
-  sub "watch the task for a while; nothing re-drives it"
+  sub "watch the task for a while; nothing picks the resume back up"
   local waited=0
   while (( waited < 12 )); do
-    echo "  t=${waited}s phase=$(task_phase "${TASK}")"
+    echo "  t=${waited}s phase=$(task_phase "${TASK}") actor=$(actor_state "${TASK}")"
     sleep 3; waited=$((waited + 3))
   done
+  note "the client that asked for the resume saw: $(tail -1 "${WORKDIR}/resume.log")"
   note "fake: $(introspect)"
 
   DIRECT_RESULT="$(task_phase "${TASK}")"
+  DIRECT_ACTOR="$(actor_state "${TASK}")"
   stop_stack
 }
 
@@ -88,17 +94,19 @@ run_temporal() {
   knob delay-resume=0
   sub "restart ax-server (temporal); the worker reconnects"
   start_server temporal
-  sub "the abandoned resume is rescheduled after its heartbeat timeout"
+  sub "Temporal reruns the resume once the dead worker's heartbeat lapses (about a minute)"
+  local t0=${SECONDS}
   if wait_for_phase "${TASK}" Running "${RECOVER_TIMEOUT}"; then
-    ok "the TaskWorkflow resumed and the task reached Running"
+    ok "the task reached Running $((SECONDS - t0))s after the restart"
   else
     err "task did not recover inside ${RECOVER_TIMEOUT}s; phase is $(task_phase "${TASK}")"
   fi
+  note "the client that asked for the resume saw: $(tail -1 "${WORKDIR}/resume.log")"
   note "fake: $(introspect)"
-  note "retry proof: ResumeActor $(grep 'ActivityType=ResumeActor' "${WORKDIR}/ax-server.log" \
-    | grep -oE 'Attempt=[0-9]+' | sort -u | tr '\n' ' ')in the log"
+  note "highest ResumeActor attempt in the ax-server log: $(max_attempt ResumeActor)"
 
   TEMPORAL_RESULT="$(task_phase "${TASK}")"
+  TEMPORAL_ACTOR="$(actor_state "${TASK}")"
   stop_stack
 }
 
@@ -111,8 +119,13 @@ main() {
   run_temporal
 
   step "VERDICT"
-  echo "direct:   stuck ${DIRECT_RESULT} (no re-drive)"
-  echo "temporal: ${TEMPORAL_RESULT} (workflow resumed)"
+  check direct "${DIRECT_RESULT}/${DIRECT_ACTOR}" '^Suspended/ACTOR_STATE_SUSPENDED$' \
+    "Suspended. The resume died with ax-server and nothing finished it." \
+    "got ${DIRECT_RESULT:-none}/${DIRECT_ACTOR:-none}, expected Suspended/SUSPENDED"
+  check temporal "${TEMPORAL_RESULT}/${TEMPORAL_ACTOR}" '^Running/ACTOR_STATE_RUNNING$' \
+    "Running. The restarted worker finished the resume that was in flight." \
+    "got ${TEMPORAL_RESULT:-none}/${TEMPORAL_ACTOR:-none}, expected Running/RUNNING"
+  summarize "both clients saw the crash. Only Temporal finished the work it had accepted."
 }
 
 main "$@"
