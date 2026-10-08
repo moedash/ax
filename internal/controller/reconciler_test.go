@@ -130,7 +130,6 @@ func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.Susp
 	return &ateapipb.SuspendActorResponse{}, nil
 }
 
-
 func (m *mockControlServer) RevertActor(_ context.Context, req *ateapipb.RevertActorRequest) (*ateapipb.RevertActorResponse, error) {
 	name := req.GetActor().GetName()
 	m.revertedActors = append(m.revertedActors, name)
