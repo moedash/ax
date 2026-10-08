@@ -52,6 +52,9 @@ type fakeTasks struct {
 	// unavailableGets is how many Gets in a row answer as if no worker were
 	// there, which is what a server restart looks like to a watch.
 	unavailableGets int
+	// changePending makes Suspend and Resume answer as if the worker took the
+	// change and is still carrying it out.
+	changePending bool
 	// lastLimit records the limit the server asked a listing for.
 	lastLimit int64
 	// deleted records the tasks whose Delete ran to the end.
@@ -159,6 +162,10 @@ func (f *fakeTasks) setSuspend(atespace, name string, suspend bool) (*v1alpha1.T
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if f.changePending {
+		return nil, fmt.Errorf("%w: %s", orchestration.ErrTaskChangePending,
+			fakeKey(atespace, name))
+	}
 	task, ok := f.tasks[fakeKey(atespace, name)]
 	if !ok {
 		return nil, orchestration.ErrTaskNotFound
@@ -522,5 +529,11 @@ func TestTemporalPathErrorCodes(t *testing.T) {
 	if _, err := srv.GetTask(ctx, &v1alpha1.GetTaskRequest{Name: "missing"}); status.Code(
 		err) != codes.Unavailable {
 		t.Errorf("expected Unavailable when no worker answers, got %v", err)
+	}
+
+	tasks.changePending = true
+	if _, err := srv.SuspendTask(ctx, &v1alpha1.SuspendTaskRequest{Name: "busy"}); status.Code(
+		err) != codes.DeadlineExceeded {
+		t.Errorf("expected DeadlineExceeded for a change still running, got %v", err)
 	}
 }

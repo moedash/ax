@@ -54,6 +54,9 @@ type fakeTemporal struct {
 	updateErr    error
 	// blockUpdate holds the update open until the caller's context expires.
 	blockUpdate bool
+	// blockResult accepts the update but holds its answer until the caller's
+	// context expires, which is a worker still carrying the change out.
+	blockResult bool
 
 	// queryResult and queryErr answer QueryWorkflowWithOptions. queryRejected
 	// stands in for the service rejecting the query because the run is closed,
@@ -109,7 +112,7 @@ func (f *fakeTemporal) answerUpdate(ctx context.Context) (sdkclient.WorkflowUpda
 	if f.updateErr != nil {
 		return nil, f.updateErr
 	}
-	return &fakeUpdateHandle{result: f.updateResult}, nil
+	return &fakeUpdateHandle{result: f.updateResult, block: f.blockResult}, nil
 }
 
 func (f *fakeTemporal) QueryWorkflowWithOptions(
@@ -173,6 +176,7 @@ func (e listedExecution) info() *workflowpb.WorkflowExecutionInfo {
 
 type fakeUpdateHandle struct {
 	result any
+	block  bool
 }
 
 func (h *fakeUpdateHandle) WorkflowID() string { return "" }
@@ -180,6 +184,10 @@ func (h *fakeUpdateHandle) RunID() string      { return "" }
 func (h *fakeUpdateHandle) UpdateID() string   { return "" }
 
 func (h *fakeUpdateHandle) Get(ctx context.Context, valuePtr any) error {
+	if h.block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	if valuePtr == nil || h.result == nil {
 		return nil
 	}
@@ -462,6 +470,21 @@ func TestSuspendReportsUnavailableWhenNoWorkerAnswers(t *testing.T) {
 	}
 }
 
+// A worker that took the change and is still carrying it out is a different
+// answer from no worker at all. The change keeps going, so it is pending, not
+// unavailable.
+func TestSuspendReportsPendingWhenTheChangeIsStillRunning(t *testing.T) {
+	client := newTestClient(&fakeTemporal{blockResult: true})
+
+	_, err := client.Suspend(context.Background(), "team-a", "job")
+	if !errors.Is(err, orchestration.ErrTaskChangePending) {
+		t.Fatalf("expected %v, got %v", orchestration.ErrTaskChangePending, err)
+	}
+	if errors.Is(err, orchestration.ErrTaskUnavailable) {
+		t.Errorf("a change the worker accepted is not unavailable: %v", err)
+	}
+}
+
 func TestSuspendAnswersWithTheTask(t *testing.T) {
 	suspended := runningTask()
 	suspended.Status.Phase = v1alpha1.PhaseSuspended
@@ -480,6 +503,9 @@ func TestSuspendAnswersWithTheTask(t *testing.T) {
 	}
 	if fake.updateOptions.UpdateName != workflows.UpdateSuspend {
 		t.Errorf("expected the suspend update, got %q", fake.updateOptions.UpdateName)
+	}
+	if fake.updateOptions.WaitForStage != sdkclient.WorkflowUpdateStageAccepted {
+		t.Errorf("expected to wait for acceptance first, got %v", fake.updateOptions.WaitForStage)
 	}
 }
 
