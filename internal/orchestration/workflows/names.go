@@ -20,6 +20,8 @@
 package workflows
 
 import (
+	"go.temporal.io/sdk/temporal"
+
 	"github.com/google/ax/pkg/apis/v1alpha1"
 )
 
@@ -37,9 +39,17 @@ const (
 	UpdateSuspend = "suspend"
 	// UpdateResume puts a suspended sandbox back on a worker.
 	UpdateResume = "resume"
+	// UpdateComplete records how the task command exited. The runner inside the
+	// sandbox sends it.
+	UpdateComplete = "complete"
 	// UpdateDelete tears the sandbox down and ends the task.
 	UpdateDelete = "delete"
 )
+
+// SignalComplete carries the same payload as UpdateComplete. The runner falls
+// back to it when it is shutting down and cannot wait for an update to be
+// accepted.
+const SignalComplete = "complete"
 
 // Query names.
 const (
@@ -62,6 +72,34 @@ const (
 	ErrTypeTeardownFailed = "TeardownFailed"
 	// ErrTypeInvalidTask rejects an update whose task spec cannot be applied.
 	ErrTypeInvalidTask = "InvalidTask"
+	// ErrTypeStaleReport rejects a completion report from a sandbox the task
+	// has since replaced.
+	ErrTypeStaleReport = "StaleReport"
+)
+
+// Search attributes carry enough of a task in visibility to list tasks, and to
+// find the tasks that bind a workspace, without asking each task in turn. They
+// have to exist in the namespace before a worker starts:
+//
+//	temporal operator search-attribute create \
+//	  --name AxAtespace   --type Keyword \
+//	  --name AxPhase      --type Keyword \
+//	  --name AxWorkspaces --type KeywordList
+const (
+	// AtespaceSearchAttribute carries a task's atespace.
+	AtespaceSearchAttribute = "AxAtespace"
+	// PhaseSearchAttribute carries status.phase, so a listing reads a task's
+	// state from visibility rather than from the task itself.
+	PhaseSearchAttribute = "AxPhase"
+	// WorkspacesSearchAttribute carries the workspaces a task binds.
+	WorkspacesSearchAttribute = "AxWorkspaces"
+)
+
+// Typed handles for the search attributes above.
+var (
+	AtespaceKey   = temporal.NewSearchAttributeKeyKeyword(AtespaceSearchAttribute)
+	PhaseKey      = temporal.NewSearchAttributeKeyKeyword(PhaseSearchAttribute)
+	WorkspacesKey = temporal.NewSearchAttributeKeyKeywordList(WorkspacesSearchAttribute)
 )
 
 // TaskWorkflowID returns the workflow ID of a task. It is the task's business
@@ -102,4 +140,17 @@ type TaskWorkflowInput struct {
 	Failed          bool
 	TeardownFailed  bool
 	TeardownMessage string
+}
+
+// CompleteInput reports how the task command finished.
+type CompleteInput struct {
+	// ExitCode is the command's exit status, or -1 when it was killed.
+	ExitCode int32
+	// Message is an optional note from the runner, such as why the command was
+	// stopped.
+	Message string
+	// Generation is the sandbox generation the report comes from, read from the
+	// container's environment. A report from a generation the task has replaced
+	// is dropped: it says how the old sandbox's command ended, not this one's.
+	Generation int
 }

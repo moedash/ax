@@ -173,6 +173,27 @@ func (s *taskWorkflowSuite) updateTask(
 	}, at)
 }
 
+// updateStatus is updateTask for the handlers that answer with a status.
+func (s *taskWorkflowSuite) updateStatus(
+	at time.Duration,
+	name, id string,
+	got **v1alpha1.TaskStatus,
+	args ...any,
+) {
+	s.env.RegisterDelayedCallback(func() {
+		s.env.UpdateWorkflow(name, id, &testsuite.TestUpdateCallback{
+			OnReject: func(err error) { s.Failf("update rejected", "%s: %v", name, err) },
+			OnAccept: func() {},
+			OnComplete: func(result any, err error) {
+				s.Require().NoError(err)
+				status, ok := result.(*v1alpha1.TaskStatus)
+				s.Require().True(ok, "unexpected %s result %T", name, result)
+				*got = status
+			},
+		}, args...)
+	}, at)
+}
+
 // resume puts the task to work. A task is created suspended, so a test that
 // wants it running starts with this.
 func (s *taskWorkflowSuite) resume(at time.Duration) {
@@ -501,6 +522,8 @@ func (s *taskWorkflowSuite) TestTemplateNameIsDerivedFromTheSpec() {
 	s.Require().True(ok)
 	s.Equal(templateName(0), got.Template.Name)
 	s.Equal("default", got.Template.Atespace)
+	s.Equal("default/test-task", got.WorkflowID)
+	s.Equal(0, got.Generation)
 }
 
 func (s *taskWorkflowSuite) TestActorFailureRollsBackProvisioning() {
@@ -632,6 +655,52 @@ func (s *taskWorkflowSuite) TestSuspendingASuspendedTaskChangesNothing() {
 	s.Equal(v1alpha1.PhaseSuspended, suspended.GetStatus().GetPhase())
 }
 
+func (s *taskWorkflowSuite) TestCompleteRecordsTheExitCode() {
+	var completed *v1alpha1.TaskStatus
+	var deletedWhileCompleted []string
+
+	s.resume(time.Second)
+	s.updateStatus(2*time.Second, workflows.UpdateComplete, "complete-1", &completed,
+		workflows.CompleteInput{ExitCode: 3, Message: "agent exited with code 3"})
+	s.env.RegisterDelayedCallback(func() {
+		deletedWhileCompleted = s.calls.get(&s.calls.delActors)
+	}, 3*time.Second)
+	s.delete(4 * time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.Require().NotNil(completed)
+	s.Equal(v1alpha1.PhaseCompleted, completed.GetPhase())
+	s.Require().NotNil(completed.ExitCode)
+	s.Equal(int32(3), completed.GetExitCode())
+	assertCondition(s.T(), completed, v1alpha1.ConditionReady, v1alpha1.ConditionFalse,
+		"CommandExited")
+	// The sandbox stays up after the command exits so its workspace can still be
+	// inspected.
+	s.Empty(deletedWhileCompleted)
+}
+
+// The runner falls back to a signal when it cannot wait for an update.
+func (s *taskWorkflowSuite) TestCompletionSignalRecordsTheExitCode() {
+	var completed *v1alpha1.TaskStatus
+
+	s.resume(time.Second)
+	s.env.RegisterDelayedCallback(func() {
+		s.env.SignalWorkflow(workflows.SignalComplete, workflows.CompleteInput{ExitCode: 0})
+	}, 2*time.Second)
+	s.env.RegisterDelayedCallback(func() { completed = s.queryStatus() }, 3*time.Second)
+	s.delete(4 * time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.Require().NotNil(completed)
+	s.Equal(v1alpha1.PhaseCompleted, completed.GetPhase())
+	s.Require().NotNil(completed.ExitCode)
+	s.Equal(int32(0), completed.GetExitCode())
+}
+
 func (s *taskWorkflowSuite) TestDeleteTearsDownAndRejectsFurtherChanges() {
 	// The actor is slow to go, so the task spends a while Terminating.
 	s.calls.deleteActorErr = temporal.NewApplicationError("actor is still stopping",
@@ -684,7 +753,11 @@ func (s *taskWorkflowSuite) TestResyncRevertsACrashedSandbox() {
 	}, 2*time.Second)
 	var recovered *v1alpha1.TaskStatus
 	s.env.RegisterDelayedCallback(func() { recovered = s.queryStatus() }, 6*time.Minute)
-	s.delete(6*time.Minute + time.Second)
+	// The sandbox is the one the task had, so a report from it is still taken.
+	var completed *v1alpha1.TaskStatus
+	s.updateStatus(6*time.Minute+time.Second, workflows.UpdateComplete, "complete-1", &completed,
+		workflows.CompleteInput{ExitCode: 0, Generation: 0})
+	s.delete(6*time.Minute + 2*time.Second)
 
 	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
 	s.Require().NoError(s.env.GetWorkflowError())
@@ -699,6 +772,8 @@ func (s *taskWorkflowSuite) TestResyncRevertsACrashedSandbox() {
 	s.Require().NotNil(recovered)
 	s.Equal(v1alpha1.PhaseRunning, recovered.GetPhase())
 	s.Equal(workerIP, recovered.GetWorkerIp())
+	s.Require().NotNil(completed)
+	s.Equal(v1alpha1.PhaseCompleted, completed.GetPhase())
 }
 
 // A crashed sandbox that cannot be reverted is given up on: the task moves to
@@ -1054,6 +1129,32 @@ func (s *taskWorkflowSuite) TestContinueAsNewKeepsATaskSuspended() {
 	s.Equal("test-task", next.Desired.GetTask().GetMetadata().GetName())
 }
 
+// A completion left in the channel goes into the next run instead of down with
+// this one.
+func (s *taskWorkflowSuite) TestContinueAsNewKeepsABufferedCompletion() {
+	s.env.SetContinueAsNewSuggested(true)
+	s.env.RegisterDelayedCallback(func() {
+		// Buffered without running workflow code, so it is still in the channel
+		// when the run is on its way out.
+		s.env.SignalWorkflowSkippingWorkflowTask(workflows.SignalComplete,
+			workflows.CompleteInput{ExitCode: 9})
+		s.env.SignalWorkflow(workflows.SignalComplete, workflows.CompleteInput{ExitCode: 9})
+	}, 0)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+
+	s.True(s.env.IsWorkflowCompleted())
+	var continued *workflow.ContinueAsNewError
+	s.Require().ErrorAs(s.env.GetWorkflowError(), &continued)
+
+	var next workflows.TaskWorkflowInput
+	s.Require().NoError(converter.GetDefaultDataConverter().FromPayloads(continued.Input, &next))
+	s.Require().NotNil(next.Status)
+	s.Require().NotNil(next.Status.ExitCode)
+	s.Equal(int32(9), next.Status.GetExitCode())
+	s.Equal(v1alpha1.PhaseCompleted, next.Status.GetPhase())
+}
+
 // A task is only gone once its sandbox is. A teardown that cannot finish keeps
 // the task answerable, and a later delete tries again.
 func (s *taskWorkflowSuite) TestATeardownThatFailsKeepsTheTask() {
@@ -1117,6 +1218,78 @@ func (s *taskWorkflowSuite) TestAStartWithNoSpecWaitsForTheApply() {
 	s.Empty(s.calls.get(&s.calls.resumes))
 }
 
+// A completion report names the sandbox it comes from. One from a sandbox the
+// task has since replaced says how that sandbox's command ended, not how the
+// current one is doing, and is refused on both paths it can arrive by.
+func (s *taskWorkflowSuite) TestACompletionFromAReplacedSandboxIsRefused() {
+	s.resume(time.Second)
+	// The sandbox crashes and cannot be reverted, so the task replaces it.
+	s.env.RegisterDelayedCallback(func() {
+		s.calls.set(func() {
+			s.calls.actorState = activities.ActorStateCrashed
+			s.calls.revertErr = permanent("no snapshot to revert to")
+		})
+	}, 2*time.Second)
+
+	var rejection error
+	s.env.RegisterDelayedCallback(func() {
+		stale := workflows.CompleteInput{ExitCode: -1, Message: "stopped", Generation: 0}
+		s.refuse(workflows.UpdateComplete, "complete-stale", &rejection, stale)
+		// The signal path has no validator, so the same report is dropped there.
+		s.env.SignalWorkflow(workflows.SignalComplete, stale)
+	}, 6*time.Minute)
+	var afterStale *v1alpha1.TaskStatus
+	s.env.RegisterDelayedCallback(func() { afterStale = s.queryStatus() },
+		6*time.Minute+time.Second)
+
+	var completed *v1alpha1.TaskStatus
+	s.updateStatus(6*time.Minute+2*time.Second, workflows.UpdateComplete, "complete-1", &completed,
+		workflows.CompleteInput{ExitCode: 0, Generation: 1})
+	s.delete(6*time.Minute + 3*time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.Len(s.calls.get(&s.calls.actors), 2, "the sandbox was replaced")
+	s.Equal(workflows.ErrTypeStaleReport, errorType(rejection),
+		"a report from the replaced sandbox is refused")
+	s.Require().NotNil(afterStale)
+	s.Equal(v1alpha1.PhaseRunning, afterStale.GetPhase())
+	s.Nil(afterStale.ExitCode)
+
+	s.Require().NotNil(completed, "a report from the current sandbox is taken")
+	s.Equal(v1alpha1.PhaseCompleted, completed.GetPhase())
+	s.Equal(int32(0), completed.GetExitCode())
+}
+
+// A replacement sandbox has not run its command yet, so how the command in the
+// sandbox before it ended does not carry over.
+func (s *taskWorkflowSuite) TestReplacingTheSandboxResetsCompletion() {
+	s.resume(time.Second)
+	var completed *v1alpha1.TaskStatus
+	s.updateStatus(2*time.Second, workflows.UpdateComplete, "complete-1", &completed,
+		workflows.CompleteInput{ExitCode: 3})
+	// The sandbox vanishes; the resync notices and builds another.
+	s.env.RegisterDelayedCallback(func() {
+		s.calls.set(func() { s.calls.actorExists = false })
+	}, 3*time.Second)
+	var replaced *v1alpha1.TaskStatus
+	s.env.RegisterDelayedCallback(func() { replaced = s.queryStatus() }, 6*time.Minute)
+	s.delete(6*time.Minute + time.Second)
+
+	s.env.ExecuteWorkflow(workflows.TaskWorkflowType, testInput())
+	s.Require().NoError(s.env.GetWorkflowError())
+
+	s.Require().NotNil(completed)
+	s.Equal(v1alpha1.PhaseCompleted, completed.GetPhase())
+
+	s.Len(s.calls.get(&s.calls.actors), 2, "the vanished sandbox is provisioned again")
+	s.Equal([]string{templateName(0), templateName(1)}, s.calls.get(&s.calls.templates))
+	s.Require().NotNil(replaced)
+	s.Equal(v1alpha1.PhaseRunning, replaced.GetPhase())
+	s.Nil(replaced.ExitCode)
+}
+
 // A spec whose identity names another workflow cannot be applied here, whatever
 // client sent it: the actor would land in one atespace while the ID said
 // another.
@@ -1146,13 +1319,15 @@ func (s *taskWorkflowSuite) TestApplyRejectsASpecForAnotherTask() {
 		"nothing is provisioned in the other atespace")
 }
 
-// Before the first apply there is no spec to change, so those updates are
-// refused rather than dereferencing nothing.
+// Before the first apply there is no spec to change and no sandbox to report
+// on, so those updates are refused rather than dereferencing nothing.
 func (s *taskWorkflowSuite) TestChangesBeforeTheFirstApplyAreRejected() {
-	var suspendErr, resumeErr error
+	var suspendErr, resumeErr, completeErr error
 	s.env.RegisterDelayedCallback(func() {
 		s.refuse(workflows.UpdateSuspend, "suspend-early", &suspendErr)
 		s.refuse(workflows.UpdateResume, "resume-early", &resumeErr)
+		s.refuse(workflows.UpdateComplete, "complete-early", &completeErr,
+			workflows.CompleteInput{ExitCode: 0})
 	}, time.Second)
 
 	// The start carries nothing and the apply never comes, so the task gives up.
@@ -1161,6 +1336,7 @@ func (s *taskWorkflowSuite) TestChangesBeforeTheFirstApplyAreRejected() {
 
 	s.Equal(workflows.ErrTypeInvalidTask, errorType(suspendErr), "suspend before the first apply")
 	s.Equal(workflows.ErrTypeInvalidTask, errorType(resumeErr), "resume before the first apply")
+	s.Equal(workflows.ErrTypeInvalidTask, errorType(completeErr), "complete before the first apply")
 }
 
 // A delete does not wait for a pass that is still retrying its way to a

@@ -217,7 +217,7 @@ func (s *Server) watchTaskWorkflow(
 // at: it can do work, or it never will.
 func watchDone(task *v1alpha1.Task) bool {
 	switch task.GetStatus().GetPhase() {
-	case v1alpha1.PhaseFailed:
+	case v1alpha1.PhaseFailed, v1alpha1.PhaseCompleted:
 		return true
 	case v1alpha1.PhaseRunning:
 		for _, c := range task.GetStatus().GetConditions() {

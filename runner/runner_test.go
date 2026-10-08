@@ -101,8 +101,12 @@ func TestRun_StopsRunningCommandOnCancel(t *testing.T) {
 	h.cancel()
 
 	h.waitFinished(t, 5*time.Second)
-	if exit := h.waitExit(t); exit.Err == nil {
+	exit := h.waitExit(t)
+	if exit.Err == nil {
 		t.Errorf("expected the stopped command to report a signal exit, got %+v", exit)
+	}
+	if !exit.Stopped {
+		t.Errorf("expected the exit to say the runner stopped the command, got %+v", exit)
 	}
 }
 

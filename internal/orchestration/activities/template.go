@@ -41,10 +41,10 @@ const templateDigestBytes = 4
 // a new template, and an unchanged spec for the same generation always yields
 // the same one, which is what makes template provisioning idempotent.
 //
-// The generation is in the name so a sandbox the workflow has replaced is built
-// from a template of its own rather than the one its predecessor left behind.
-// Substrate fixes a template's environment when the template is created, so a
-// template cannot be repurposed in place.
+// The generation is in the name because it is in the container: the runner
+// reports it with the command's exit, and the workflow drops a report from a
+// sandbox it has since replaced. Substrate fixes a template's environment when
+// the template is created, so each generation needs a template of its own.
 //
 // The digest is taken over named fields rather than over marshaled bytes. Wire
 // bytes are a property of the protobuf library, so an upgrade of it could
@@ -157,7 +157,8 @@ func SandboxSpec(task *v1alpha1.Task) *v1alpha1.Task {
 }
 
 // containerEnv builds the environment of a task's container: the task's own
-// env, the model credentials, and the specs the runner needs.
+// env, the model credentials, the specs the runner needs, and the coordinates
+// of the workflow that owns the task.
 func (a *Activities) containerEnv(
 	ctx context.Context,
 	in TemplateInput,
@@ -185,6 +186,21 @@ func (a *Activities) containerEnv(
 	}
 	if wsYAML != "" {
 		env[v1alpha1.EnvWorkspacesYAML] = wsYAML
+	}
+
+	// Without these the sandbox has no route to the control plane, and the runner
+	// only logs how the command finished.
+	if a.ReportCompletion {
+		if in.WorkflowID != "" {
+			env[v1alpha1.EnvWorkflowID] = in.WorkflowID
+		}
+		if a.TemporalAddress != "" {
+			env[v1alpha1.EnvTemporalAddress] = a.TemporalAddress
+		}
+		if a.TemporalNamespace != "" {
+			env[v1alpha1.EnvTemporalNamespace] = a.TemporalNamespace
+		}
+		env[v1alpha1.EnvSandboxGeneration] = strconv.Itoa(in.Generation)
 	}
 	return env, nil
 }

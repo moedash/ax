@@ -60,6 +60,16 @@ type Activities struct {
 	// RouterAddr is the atenet router used to reach a sandbox by actor name when
 	// its worker IP is not routable from the worker.
 	RouterAddr string
+	// ReportCompletion hands task containers the coordinates of their own
+	// workflow so the runner can report the command's exit status. It is off by
+	// default: anything running in a sandbox could then reach the frontend and
+	// address other workflows, which is only as safe as the frontend's own
+	// authentication.
+	ReportCompletion bool
+	// TemporalAddress and TemporalNamespace are the coordinates handed over when
+	// ReportCompletion is set.
+	TemporalAddress   string
+	TemporalNamespace string
 	// HTTPClient probes sandbox readiness. Nil uses a client with probeTimeout.
 	HTTPClient *http.Client
 }
@@ -90,6 +100,13 @@ type TemplateInput struct {
 	Image      string
 	Task       *v1alpha1.Task
 	Workspaces []*v1alpha1.Workspace
+	// WorkflowID is injected into the container so the runner can address the
+	// task workflow that owns it.
+	WorkflowID string
+	// Generation is the sandbox generation this template is built for. The
+	// runner reports it with the command's exit, so a report from a sandbox that
+	// has since been replaced can be told apart from the current one.
+	Generation int
 }
 
 // ActorInput describes the actor to provision and the template it derives from.

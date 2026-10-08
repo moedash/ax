@@ -149,6 +149,7 @@ func runTask(ctx workflow.Context, cfg Config, in TaskWorkflowInput) error {
 			// asked for.
 			r.settleWorkspace(ctx)
 			if workflow.GetInfo(ctx).GetContinueAsNewSuggested() {
+				r.drainCompletions(ctx)
 				if r.pending() {
 					continue
 				}
@@ -163,6 +164,9 @@ func runTask(ctx workflow.Context, cfg Config, in TaskWorkflowInput) error {
 				if r.pending() {
 					continue
 				}
+				// Anything signalled while we yielded above would go down with
+				// this run, so the channel is taken again on the way out.
+				r.drainCompletions(ctx)
 				logger.Info("continuing task workflow as new", "task", r.key())
 				return workflow.NewContinueAsNewError(ctx, TaskWorkflowType, r.continueInput())
 			}
@@ -222,6 +226,7 @@ type taskRun struct {
 	// or a completion report from a sandbox that has since been replaced can be
 	// told from one about the current sandbox and dropped.
 	generation int
+	completed  bool
 	failed     bool
 	deleting   bool
 	deleted    bool
@@ -236,6 +241,8 @@ type taskRun struct {
 	// interrupt cancels the step the main loop is in, so a delete does not wait
 	// for a pass that is still retrying. It is nil between steps.
 	interrupt workflow.CancelFunc
+
+	completions workflow.ReceiveChannel
 }
 
 // interruptible runs one step of the main loop under a context handleDelete
@@ -267,6 +274,9 @@ func newTaskRun(ctx workflow.Context, in TaskWorkflowInput) (*taskRun, error) {
 		// Workspace setup happens once per task and its result outlives suspends,
 		// actor failures, and continue-as-new.
 		r.workspaceProbed = true
+	}
+	if r.status.GetPhase() == v1alpha1.PhaseCompleted || r.status.ExitCode != nil {
+		r.completed = true
 	}
 
 	// A task started by an update-with-start carries no spec here: the update
@@ -315,6 +325,7 @@ func (r *taskRun) adopt(ctx workflow.Context, desired *TaskDesiredState) error {
 		r.status.Id = fmt.Sprintf("task-%s-%d", r.status.Actor, workflow.Now(ctx).Unix())
 	}
 	r.syncPhase(ctx)
+	r.upsertSearchAttributes(ctx)
 	return nil
 }
 
@@ -448,6 +459,8 @@ func (r *taskRun) provision(ctx workflow.Context) error {
 		Image:      desired.Task.GetSpec().GetImage(),
 		Task:       desired.Task,
 		Workspaces: desired.Workspaces,
+		WorkflowID: workflow.GetInfo(ctx).WorkflowExecution.ID,
+		Generation: r.generation,
 	}
 	var provisionedTemplate activities.TemplateProvision
 	if err := workflow.ExecuteActivity(provisionCtx, acts.EnsureActorTemplate, templateIn).
@@ -569,6 +582,9 @@ func (r *taskRun) syncReady(ctx workflow.Context) {
 	case r.sandbox == sandboxSuspended:
 		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "TaskSuspended",
 			"Task is suspended")
+	case r.completed:
+		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "CommandExited",
+			fmt.Sprintf("Task command exited with code %d", r.status.GetExitCode()))
 	case r.conditionTrue(v1alpha1.ConditionWorkspaceReady):
 		r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionTrue, "TaskRunning",
 			"Task is running and its workspace is ready")
@@ -696,14 +712,18 @@ func (r *taskRun) revertSandbox(ctx workflow.Context) {
 
 // forgetSandbox drops what the workflow believes about the sandbox so the next
 // pass builds a new one. The workspace inside a replacement sandbox is set up
-// from scratch, so its readiness has to be established again too.
+// from scratch, so its readiness has to be established again too, and the
+// command inside it has not run yet, so how the old one ended is dropped.
 func (r *taskRun) forgetSandbox(ctx workflow.Context, reason, message string) {
 	r.provisioned = nil
 	r.sandbox = sandboxUnknown
 	r.status.WorkerIp = ""
 	r.workspaceProbed = false
+	r.completed = false
+	r.status.ExitCode = nil
 	// A probe still talking to the old sandbox is now stale: its answer is
-	// dropped, and the replacement gets a probe of its own.
+	// dropped, and the replacement gets a probe of its own. The same goes for a
+	// completion report the old sandbox has yet to send.
 	r.probing = false
 	r.generation++
 	r.setCondition(ctx, v1alpha1.ConditionWorkspaceReady, v1alpha1.ConditionFalse, reason, message)
@@ -820,6 +840,7 @@ func (r *taskRun) key() string {
 // place is what keeps a task from reporting Running after its command exited,
 // or Completed while its sandbox is suspended.
 func (r *taskRun) syncPhase(ctx workflow.Context) {
+	before := r.status.GetPhase()
 	switch {
 	case r.deleting || r.deleted:
 		r.status.Phase = v1alpha1.PhaseTerminating
@@ -827,6 +848,10 @@ func (r *taskRun) syncPhase(ctx workflow.Context) {
 		// A task that was asked to go and could not is the operator's problem,
 		// whatever its sandbox is doing.
 		r.status.Phase = v1alpha1.PhaseFailed
+	case r.completed:
+		// How the command finished outlives what the sandbox is doing now, so a
+		// task that has run to its end says so.
+		r.status.Phase = v1alpha1.PhaseCompleted
 	case r.failed:
 		r.status.Phase = v1alpha1.PhaseFailed
 	case r.sandbox == sandboxSuspended:
@@ -835,6 +860,70 @@ func (r *taskRun) syncPhase(ctx workflow.Context) {
 		r.status.Phase = v1alpha1.PhaseRunning
 	default:
 		r.status.Phase = v1alpha1.PhasePending
+	}
+
+	// Visibility carries the phase so that listing tasks does not mean asking
+	// every one of them what it is doing.
+	if r.status.GetPhase() != before {
+		r.upsertSearchAttributes(ctx)
+	}
+}
+
+// upsertSearchAttributes publishes the parts of a task that visibility answers
+// for: where it lives, what it is doing, and the configuration it binds.
+func (r *taskRun) upsertSearchAttributes(ctx workflow.Context) {
+	if r.desired == nil {
+		return
+	}
+	workspaces := make([]string, 0, len(r.desired.Workspaces))
+	for _, ref := range r.desired.Task.GetSpec().WorkspaceRefs() {
+		if ref.GetName() != "" {
+			workspaces = append(workspaces, ref.GetName())
+		}
+	}
+	// An attribute the namespace does not have fails the workflow task, not this
+	// call, so there is nothing useful to do with the error here. The worker
+	// checks the attributes exist before it starts, which is where a missing one
+	// is reported.
+	_ = workflow.UpsertTypedSearchAttributes(ctx,
+		AtespaceKey.ValueSet(r.desired.Task.GetMetadata().GetAtespace()),
+		PhaseKey.ValueSet(r.status.GetPhase()),
+		WorkspacesKey.ValueSet(workspaces),
+	)
+}
+
+// recordCompletion stores how the task command finished. The sandbox stays up
+// so that its workspace can still be inspected. A report from a sandbox the
+// task has since replaced is dropped here as well as in the update validator,
+// because the signal path has no validator.
+func (r *taskRun) recordCompletion(ctx workflow.Context, in CompleteInput) {
+	if in.Generation != r.generation {
+		workflow.GetLogger(ctx).Info("dropping a completion report from a replaced sandbox",
+			"task", r.key(), "reported", in.Generation, "current", r.generation)
+		return
+	}
+	exitCode := in.ExitCode
+	r.completed = true
+	r.status.ExitCode = &exitCode
+	message := in.Message
+	if message == "" {
+		message = fmt.Sprintf("Task command exited with code %d", exitCode)
+	}
+	r.setCondition(ctx, v1alpha1.ConditionReady, v1alpha1.ConditionFalse, "CommandExited", message)
+	r.syncPhase(ctx)
+	workflow.GetLogger(ctx).Info("task command exited", "task", r.key(), "exitCode", exitCode)
+}
+
+// drainCompletions takes anything left in the completion channel before the
+// workflow continues as new, because a buffered signal would otherwise be lost
+// with the run that was carrying it.
+func (r *taskRun) drainCompletions(ctx workflow.Context) {
+	for {
+		var in CompleteInput
+		if !r.completions.ReceiveAsync(&in) {
+			return
+		}
+		r.recordCompletion(ctx, in)
 	}
 }
 

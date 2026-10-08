@@ -139,6 +139,7 @@ func main() {
 			"temporalNamespace", temporalOpts.namespace,
 			"taskQueue", temporalOpts.taskQueue,
 			"resyncInterval", temporalOpts.resyncInterval,
+			"sandboxReportCompletion", temporalOpts.reportCompletion,
 		)
 		tasks, stop, err := startTemporal(context.Background(), temporalOpts, subClient, logger)
 		if err != nil {

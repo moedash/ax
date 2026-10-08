@@ -45,10 +45,28 @@ func (r *taskRun) registerHandlers(ctx workflow.Context) error {
 		workflow.UpdateHandlerOptions{Validator: r.validateRunning}); err != nil {
 		return err
 	}
+	if err := workflow.SetUpdateHandlerWithOptions(ctx, UpdateComplete, r.handleComplete,
+		workflow.UpdateHandlerOptions{Validator: r.validateComplete}); err != nil {
+		return err
+	}
 	if err := workflow.SetUpdateHandlerWithOptions(ctx, UpdateDelete, r.handleDelete,
 		workflow.UpdateHandlerOptions{Validator: r.validateDelete}); err != nil {
 		return err
 	}
+
+	// The runner reports a command exit as an update so that it learns the report
+	// landed. When it is shutting down it cannot wait for that, so the same
+	// payload is accepted as a signal and handled here.
+	r.completions = workflow.GetSignalChannel(ctx, SignalComplete)
+	workflow.Go(ctx, func(gctx workflow.Context) {
+		for {
+			var in CompleteInput
+			if !r.completions.Receive(gctx, &in) {
+				return
+			}
+			r.recordCompletion(gctx, in)
+		}
+	})
 	return nil
 }
 
@@ -146,6 +164,33 @@ func (r *taskRun) validateRunning(ctx workflow.Context) error {
 	}
 	if r.desired == nil {
 		return taskNotApplied(r.key())
+	}
+	return nil
+}
+
+// handleComplete records how the task command exited. Nothing has to be driven
+// into Substrate, so the report is answered as soon as it is recorded.
+func (r *taskRun) handleComplete(
+	ctx workflow.Context,
+	in CompleteInput,
+) (*v1alpha1.TaskStatus, error) {
+	r.recordCompletion(ctx, in)
+	return r.statusSnapshot(), nil
+}
+
+// validateComplete rejects a report the task cannot use: one for a task that is
+// going away, and one from a sandbox the task has since replaced.
+func (r *taskRun) validateComplete(ctx workflow.Context, in CompleteInput) error {
+	if r.deleting {
+		return taskTerminating(r.key())
+	}
+	if r.desired == nil {
+		return taskNotApplied(r.key())
+	}
+	if in.Generation != r.generation {
+		return temporal.NewApplicationError(
+			fmt.Sprintf("task %s replaced sandbox generation %d with %d",
+				r.key(), in.Generation, r.generation), ErrTypeStaleReport)
 	}
 	return nil
 }

@@ -88,9 +88,10 @@ func TestProvisioningSequence(t *testing.T) {
 		Name:     activities.TaskTemplateName(task, nil, 0),
 	}
 	value, err := env.ExecuteActivity(acts.EnsureActorTemplate, activities.TemplateInput{
-		Template: template,
-		Image:    task.Spec.Image,
-		Task:     task,
+		Template:   template,
+		Image:      task.Spec.Image,
+		Task:       task,
+		WorkflowID: "default/job",
 	})
 	if err != nil {
 		t.Fatalf("EnsureActorTemplate failed: %v", err)
@@ -105,9 +106,10 @@ func TestProvisioningSequence(t *testing.T) {
 
 	// A second call finds the template rather than making another.
 	value, err = env.ExecuteActivity(acts.EnsureActorTemplate, activities.TemplateInput{
-		Template: template,
-		Image:    task.Spec.Image,
-		Task:     task,
+		Template:   template,
+		Image:      task.Spec.Image,
+		Task:       task,
+		WorkflowID: "default/job",
 	})
 	if err != nil {
 		t.Fatalf("EnsureActorTemplate failed: %v", err)
@@ -280,10 +282,14 @@ func TestRevertActorClassifiesSubstrateErrors(t *testing.T) {
 	}
 }
 
-// The runner inside the sandbox is handed the specs it needs.
+// The runner inside the sandbox is handed the specs, and the coordinates of
+// the workflow that owns the task when the worker offers them.
 func TestActorTemplateCarriesTheRunnerEnvironment(t *testing.T) {
 	control := substratetest.NewControlServer()
 	env, acts := newEnv(t, control)
+	acts.ReportCompletion = true
+	acts.TemporalAddress = "temporal-frontend.temporal.svc.cluster.local:7233"
+	acts.TemporalNamespace = "default"
 
 	task := testTask()
 	task.Status = &v1alpha1.TaskStatus{Phase: v1alpha1.PhaseRunning, WorkerIp: "10.0.0.1"}
@@ -302,6 +308,8 @@ func TestActorTemplateCarriesTheRunnerEnvironment(t *testing.T) {
 		Image:      task.Spec.Image,
 		Task:       task,
 		Workspaces: workspaces,
+		WorkflowID: "default/job",
+		Generation: 3,
 	}); err != nil {
 		t.Fatalf("EnsureActorTemplate failed: %v", err)
 	}
@@ -312,6 +320,15 @@ func TestActorTemplateCarriesTheRunnerEnvironment(t *testing.T) {
 	}
 	if got := templateEnv["GOAL"]; got != "fix the bug" {
 		t.Errorf("expected the task env to be passed through, got %q", got)
+	}
+	if got := templateEnv[v1alpha1.EnvWorkflowID]; got != "default/job" {
+		t.Errorf("expected the workflow ID in the container env, got %q", got)
+	}
+	if got := templateEnv[v1alpha1.EnvTemporalAddress]; got == "" {
+		t.Error("expected the Temporal address in the container env")
+	}
+	if got := templateEnv[v1alpha1.EnvSandboxGeneration]; got != "3" {
+		t.Errorf("expected the sandbox generation in the container env, got %q", got)
 	}
 	taskYAML := templateEnv[v1alpha1.EnvTaskYAML]
 	if !strings.Contains(taskYAML, "name: job") {
@@ -593,6 +610,46 @@ func TestInvalidInputIsNonRetryable(t *testing.T) {
 	}
 	if len(control.Atespaces()) != 0 {
 		t.Errorf("expected no call to Substrate, got %v", control.Atespaces())
+	}
+}
+
+// Reporting is off unless a worker turns it on, so nothing in the sandbox is
+// handed a route to the control plane by default.
+func TestActorTemplateWithholdsTheControlPlaneByDefault(t *testing.T) {
+	control := substratetest.NewControlServer()
+	env, acts := newEnv(t, control)
+	acts.TemporalAddress = "temporal-frontend.temporal.svc.cluster.local:7233"
+	acts.TemporalNamespace = "default"
+
+	task := testTask()
+	name := activities.TaskTemplateName(task, nil, 0)
+	if _, err := env.ExecuteActivity(acts.EnsureActorTemplate, activities.TemplateInput{
+		Template:   activities.TemplateRef{Atespace: "default", Name: name},
+		Image:      task.Spec.Image,
+		Task:       task,
+		WorkflowID: "default/job",
+	}); err != nil {
+		t.Fatalf("EnsureActorTemplate failed: %v", err)
+	}
+
+	templateEnv, err := control.TemplateEnv(name)
+	if err != nil {
+		t.Fatalf("reading the created template: %v", err)
+	}
+	withheld := []string{
+		v1alpha1.EnvWorkflowID,
+		v1alpha1.EnvTemporalAddress,
+		v1alpha1.EnvTemporalNamespace,
+		v1alpha1.EnvSandboxGeneration,
+	}
+	for _, key := range withheld {
+		if got, ok := templateEnv[key]; ok {
+			t.Errorf("expected no %s in the container env, got %q", key, got)
+		}
+	}
+	// The task's own environment and specs are still handed over.
+	if templateEnv["GOAL"] == "" || templateEnv[v1alpha1.EnvTaskYAML] == "" {
+		t.Error("expected the task env and spec to be passed through")
 	}
 }
 
