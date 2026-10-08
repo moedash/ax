@@ -90,8 +90,8 @@ run_temporal() {
   start_server temporal
   suspend_under_fault
   if (( SUSPEND_EXIT != 0 )); then
-    # The CLI waits 10s for the suspend and then gives up. Its message says no
-    # worker answered, but the worker is fine and still retrying the suspend.
+    # The CLI waits 10s for the suspend. The worker accepted it, so the CLI
+    # reports it as pending, not unavailable, and the workflow keeps retrying.
     note "the CLI stopped waiting; the workflow is still retrying SuspendActor"
   fi
 

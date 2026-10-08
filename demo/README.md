@@ -119,9 +119,9 @@ fail, ask for a suspend, then turn the fault off as if Substrate recovered.
   Once the fault is off, the next retry lands, and the task ends `Suspended`
   with the actor `SUSPENDED`. Record and actor agree.
 
-When `ax suspend` gives up waiting, it prints `no worker answered`. The worker is
-fine. The suspend is still being retried. The message comes from the CLI's wait
-timing out, and it is misleading here.
+`ax suspend` waits 10 seconds. The worker accepted the suspend, so the CLI
+reports it as pending (`DeadlineExceeded`, "accepted and is still running"), not
+as a worker that never answered. The workflow keeps retrying it.
 
 ```
 direct:   said yes. The record says Suspended, but the actor kept RUNNING and still is.
