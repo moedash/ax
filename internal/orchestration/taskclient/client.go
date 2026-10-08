@@ -329,9 +329,11 @@ func (c *Client) Resume(ctx context.Context, atespace, name string) (*v1alpha1.T
 	return c.change(ctx, atespace, name, workflows.UpdateResume)
 }
 
-// change sends an update that answers with the task. The wait is bounded, and a
-// task whose worker does not answer in that time is reported unavailable rather
-// than left hanging.
+// change sends an update that answers with the task, under one bounded wait. It
+// waits for acceptance and then for the answer, so an expired wait can tell a
+// task no worker answered for from a change its worker took and is still
+// carrying out. Only the first is unavailable. The second keeps going after the
+// call returns.
 func (c *Client) change(
 	ctx context.Context,
 	atespace, name, update string,
@@ -340,11 +342,9 @@ func (c *Client) change(
 	defer cancel()
 
 	handle, err := c.client.UpdateWorkflow(waitCtx, sdkclient.UpdateWorkflowOptions{
-		WorkflowID: workflows.TaskWorkflowID(atespaceOf(atespace), name),
-		UpdateName: update,
-		// The answer is the point of the call, so wait for it rather than for
-		// acceptance and then a second round trip.
-		WaitForStage: sdkclient.WorkflowUpdateStageCompleted,
+		WorkflowID:   workflows.TaskWorkflowID(atespaceOf(atespace), name),
+		UpdateName:   update,
+		WaitForStage: sdkclient.WorkflowUpdateStageAccepted,
 	})
 	if err != nil {
 		return nil, c.changeError(ctx, waitCtx, atespace, name, err)
@@ -352,7 +352,11 @@ func (c *Client) change(
 
 	var task v1alpha1.Task
 	if err := handle.Get(waitCtx, &task); err != nil {
-		return nil, c.changeError(ctx, waitCtx, atespace, name, err)
+		if timedOut(ctx, waitCtx) {
+			return nil, fmt.Errorf("%w: the %s of task %s/%s was accepted and is still running",
+				orchestration.ErrTaskChangePending, update, atespaceOf(atespace), name)
+		}
+		return nil, mapError(err)
 	}
 	return &task, nil
 }

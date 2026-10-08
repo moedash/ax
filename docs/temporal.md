@@ -181,7 +181,7 @@ every call the API server makes has a bounded wait:
 | Call | Waits for | If nothing answers in time |
 |---|---|---|
 | `CreateTask` | The `apply` update to complete, up to 10 seconds | The task was created; it is reported `Pending` |
-| `SuspendTask`, `ResumeTask` | The update to complete, up to 10 seconds | `Unavailable`, with the task named |
+| `SuspendTask`, `ResumeTask` | The update to be accepted and then to complete, up to 10 seconds in all | `Unavailable` if nothing accepts it. `DeadlineExceeded` if a worker accepted it and is still on it. The workflow finishes it anyway |
 | `DeleteTask` | The update to be accepted, up to 10 seconds, then the teardown for as long as it takes | `Unavailable` if nothing accepts it |
 | `GetTask` | The `task` query, up to 5 seconds | `Unavailable` |
 | `ListTasks` | A visibility list of the running workflows | Not applicable: no worker is involved |

@@ -43,6 +43,10 @@ var (
 	// ErrTaskUnavailable reports a task whose worker did not answer in time.
 	// The task exists; nothing is running to speak for it right now.
 	ErrTaskUnavailable = errors.New("task is unavailable")
+	// ErrTaskChangePending reports a change a task's worker accepted but has
+	// not finished within the wait. The workflow keeps working on it, so there
+	// is nothing to ask again.
+	ErrTaskChangePending = errors.New("task change is pending")
 )
 
 // Tasks reaches the workflow that owns each task. Tasks are addressed by their

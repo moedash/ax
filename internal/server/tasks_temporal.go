@@ -254,6 +254,8 @@ func taskError(err error, atespace, name string) error {
 		return status.Errorf(codes.FailedPrecondition, "%v", err)
 	case errors.Is(err, orchestration.ErrInvalidTask):
 		return status.Errorf(codes.InvalidArgument, "%v", err)
+	case errors.Is(err, orchestration.ErrTaskChangePending):
+		return status.Errorf(codes.DeadlineExceeded, "%v", err)
 	case errors.Is(err, orchestration.ErrTaskUnavailable):
 		return status.Errorf(codes.Unavailable, "%v", err)
 	case errors.Is(err, context.Canceled):
