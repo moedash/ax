@@ -22,7 +22,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/ax/internal/substrate"
@@ -43,10 +45,19 @@ type ControlServer struct {
 	WorkerIP string
 	// ResumeErr, when set, fails every ResumeActor call.
 	ResumeErr error
+	// SuspendErr, when set, fails every SuspendActor call.
+	SuspendErr error
 	// CreateActorErr, when set, fails every CreateActor call.
 	CreateActorErr error
 	// RevertErr, when set, fails every RevertActor call.
 	RevertErr error
+
+	// createActorFailures fails the next N CreateActor calls with Unavailable,
+	// so a transient control-plane blip can be replayed.
+	createActorFailures int
+	// resumeDelay holds every ResumeActor call open, so a resume can be
+	// interrupted while it is in flight.
+	resumeDelay time.Duration
 
 	atespaces  []string
 	actors     []string
@@ -153,6 +164,11 @@ func (s *ControlServer) CreateActor(
 ) (*ateapipb.Actor, error) {
 	s.mu.Lock()
 	failure := s.CreateActorErr
+	if failure == nil && s.createActorFailures > 0 {
+		s.createActorFailures--
+		s.mu.Unlock()
+		return nil, status.Error(codes.Unavailable, "substrate control plane is restarting")
+	}
 	s.mu.Unlock()
 	if failure != nil {
 		return nil, failure
@@ -182,10 +198,19 @@ func (s *ControlServer) ResumeActor(
 	req *ateapipb.ResumeActorRequest,
 ) (*ateapipb.ResumeActorResponse, error) {
 	s.mu.Lock()
-	failure, workerIP := s.ResumeErr, s.WorkerIP
+	failure, workerIP, delay := s.ResumeErr, s.WorkerIP, s.resumeDelay
 	s.mu.Unlock()
 	if failure != nil {
 		return nil, failure
+	}
+	if delay > 0 {
+		// Sleeping outside the lock keeps a slow resume from stalling every other
+		// call. The context is honored so a cancelled resume returns at once.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
 	}
 	name := req.GetActor().GetName()
 	s.mu.Lock()
@@ -211,6 +236,12 @@ func (s *ControlServer) SuspendActor(
 	ctx context.Context,
 	req *ateapipb.SuspendActorRequest,
 ) (*ateapipb.SuspendActorResponse, error) {
+	s.mu.Lock()
+	failure := s.SuspendErr
+	s.mu.Unlock()
+	if failure != nil {
+		return nil, failure
+	}
 	name := req.GetActor().GetName()
 	s.mu.Lock()
 	s.suspended = append(s.suspended, name)
@@ -254,6 +285,42 @@ func (s *ControlServer) SetActorState(name string, state ateapipb.ActorState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.actorState[name] = state
+}
+
+// SetSuspendErr sets or clears the error every SuspendActor call fails with, so
+// a fault can be turned on after a task is already running.
+func (s *ControlServer) SetSuspendErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.SuspendErr = err
+}
+
+// SetCreateActorFailures makes the next n CreateActor calls fail with
+// Unavailable before they start succeeding again.
+func (s *ControlServer) SetCreateActorFailures(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.createActorFailures = n
+}
+
+// SetResumeDelay holds every ResumeActor call open for d.
+func (s *ControlServer) SetResumeDelay(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resumeDelay = d
+}
+
+// ActorStates returns every actor's state, for example RUNNING, keyed by actor
+// name, so a caller can compare what the control plane really holds with what
+// AX recorded.
+func (s *ControlServer) ActorStates() map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]string, len(s.actorState))
+	for name, state := range s.actorState {
+		out[name] = strings.TrimPrefix(state.String(), "ACTOR_STATE_")
+	}
+	return out
 }
 
 func (s *ControlServer) GetActor(
